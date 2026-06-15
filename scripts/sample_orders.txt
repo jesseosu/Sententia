@@ -1,0 +1,27 @@
+# Sample order flow for the replay driver.
+#   N <id> <BUY|SELL> <LIMIT|MARKET> <GTC|IOC> <price> <qty>
+#   C <id>
+
+# Build a two-sided book.
+N 1 BUY  LIMIT GTC 100 10
+N 2 BUY  LIMIT GTC 100  5
+N 3 BUY  LIMIT GTC  99 20
+N 4 SELL LIMIT GTC 102  8
+N 5 SELL LIMIT GTC 103 15
+
+# Cross the spread partially: takes both bids at 100 in arrival order.
+N 6 SELL LIMIT GTC 100 12
+
+# Cancel the residual of order 2, then try again to see the reject.
+C 2
+C 2
+
+# Sweep the ask side with a market order that outsizes it.
+N 7 BUY MARKET IOC 0 30
+
+# An immediate-or-cancel order that crosses nothing.
+N 8 SELL LIMIT IOC 150 5
+
+# Rebuild and cross exactly.
+N 9  BUY  LIMIT GTC 99 20
+N 10 SELL LIMIT GTC 99 40
