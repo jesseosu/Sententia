@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+          - os: windows-latest
+            compiler: msvc
+          - os: macos-latest
+            compiler: appleclang
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cc }}" ]; then
+            export CC=${{ matrix.cc }}
+            export CXX=${{ matrix.cxx }}
+          fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j 4
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+  # The determinism claim is only interesting if it holds across
+  # toolchains. This job replays the same order file on every platform
+  # above and fails if any two disagree on the resulting checksums.
+  cross-platform-determinism:
+    name: cross-platform determinism
+    needs: build-and-test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 4
+
+      - name: Replay and report checksums
+        shell: bash
+        run: |
+          BIN=build/replay
+          [ -f build/Release/replay.exe ] && BIN=build/Release/replay.exe
+          "$BIN" --quiet scripts/sample_orders.txt | tee checksums.txt
+          grep -E '^(event_hash|book_checksum|state_checksum)=' checksums.txt > summary.txt
+          cat summary.txt
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: determinism-${{ matrix.os }}
+          path: summary.txt
+
+  compare-determinism:
+    name: compare checksums across platforms
+    needs: cross-platform-determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: determinism-*
+          path: results
+
+      - name: Fail if any platform disagrees
+        run: |
+          set -e
+          find results -name summary.txt | sort | while read -r f; do
+            echo "--- $f"
+            cat "$f"
+          done
+          # Every summary must be byte-identical to the first one.
+          first=$(find results -name summary.txt | sort | head -1)
+          find results -name summary.txt | sort | while read -r f; do
+            if ! diff -q "$first" "$f" > /dev/null; then
+              echo "determinism violated: $f differs from $first"
+              diff "$first" "$f" || true
+              exit 1
+            fi
+          done
+          echo "all platforms agree"
+
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: |
+          find include src tests apps bench \( -name '*.hpp' -o -name '*.cpp' \) \
+            -print0 | xargs -0 clang-format --dry-run --Werror
