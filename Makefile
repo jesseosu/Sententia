@@ -5,7 +5,7 @@ BUILD_DIR ?= build
 BUILD_TYPE ?= Release
 JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: all build configure test bench replay clean format format-check help
+.PHONY: all build configure test bench replay cluster clean format format-check help
 
 all: build
 
@@ -24,6 +24,9 @@ bench: build
 replay: build
 	./$(BUILD_DIR)/replay scripts/sample_orders.txt
 
+cluster: build
+	./scripts/cluster_up.sh scripts/cluster.conf $(BUILD_DIR)
+
 format:
 	@find include src tests apps bench -name '*.hpp' -o -name '*.cpp' | xargs clang-format -i
 
@@ -38,6 +41,7 @@ help:
 	@echo "make test          build and run the full ctest suite"
 	@echo "make bench         run the single-node baseline benchmark"
 	@echo "make replay        run the sample order file through the replay driver"
+	@echo "make cluster       launch a local 3-node cluster"
 	@echo "make format        apply clang-format in place"
 	@echo "make format-check  fail if anything is unformatted"
 	@echo "make clean         remove the build directory"

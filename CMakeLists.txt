@@ -38,6 +38,23 @@ add_library(sententia_core
 target_include_directories(sententia_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(sententia_core PRIVATE sententia_flags)
 
+# Networking layer. POSIX only: the engine core stays portable and CI
+# still builds and tests it on Windows and macOS, but the transport
+# targets the platform this project deploys to. See docs/wire-protocol.md.
+if(UNIX)
+    add_library(sententia_net
+        src/net/message.cpp
+        src/net/framing.cpp
+        src/net/socket.cpp
+        src/net/cluster_config.cpp
+        src/net/transport.cpp)
+    target_include_directories(sententia_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(sententia_net PUBLIC sententia_core PRIVATE sententia_flags)
+
+    add_executable(node apps/node/main.cpp)
+    target_link_libraries(node PRIVATE sententia_net sententia_flags)
+endif()
+
 add_executable(replay apps/replay/main.cpp)
 target_link_libraries(replay PRIVATE sententia_core sententia_flags)
 
@@ -59,12 +76,37 @@ set(SENTENTIA_TESTS
     test_determinism
     test_invariants)
 
+# Networking tests, POSIX only. The first four need no sockets at all;
+# only test_transport opens one.
+set(SENTENTIA_NET_TESTS
+    test_wire
+    test_message_codec
+    test_framing
+    test_cluster_config
+    test_transport)
+
 foreach(test_name IN LISTS SENTENTIA_TESTS)
     add_executable(${test_name} tests/${test_name}.cpp)
     target_link_libraries(${test_name} PRIVATE sententia_core sententia_flags)
     target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
+
+if(UNIX)
+    foreach(test_name IN LISTS SENTENTIA_NET_TESTS)
+        add_executable(${test_name} tests/${test_name}.cpp)
+        target_link_libraries(${test_name} PRIVATE sententia_net sententia_flags)
+        target_include_directories(${test_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        add_test(NAME ${test_name} COMMAND ${test_name})
+    endforeach()
+
+    # Two real node processes exchange heartbeats and shut down cleanly.
+    add_test(NAME two_node_demo
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/two_node_demo.sh
+                     $<TARGET_FILE:node>
+                     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/cluster_demo.conf)
+    set_tests_properties(two_node_demo PROPERTIES TIMEOUT 60)
+endif()
 
 # Replaying the sample order file twice must produce identical output.
 # This is the determinism property checked end to end, through the real

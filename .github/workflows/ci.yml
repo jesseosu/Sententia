@@ -45,6 +45,13 @@ jobs:
       - name: Test
         run: ctest --test-dir build --build-config Release --output-on-failure
 
+      # The networking layer is POSIX only, so on Windows the suite is
+      # the engine core alone. This step makes that explicit rather than
+      # leaving a silently smaller test count to be discovered later.
+      - name: Report test count
+        shell: bash
+        run: ctest --test-dir build --build-config Release -N | tail -1
+
   # The determinism claim is only interesting if it holds across
   # toolchains. This job replays the same order file on every platform
   # above and fails if any two disagree on the resulting checksums.
