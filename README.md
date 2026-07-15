@@ -7,12 +7,20 @@ deterministic recovery from node failure, extending the single-process
 [Celeritas](https://github.com/jesseosu/celeritas) engine into a
 clustered, crash-resilient system.
 
-**Status: Phase 1 complete.** The single-node core is done: pure,
-deterministic, and tested. Distribution starts in Phase 2.
+**Status: Phase 2 complete.** The single-node core is pure and
+deterministic, and nodes can now talk to each other over TCP. Replication
+starts in Phase 3.
 
 ---
 
 ## What exists today
+
+**A deterministic matching engine** (Phase 1) and **a message transport
+that connects nodes over TCP** (Phase 2). They are not wired together
+yet: that is Phase 3's job, and doing it earlier would mean guessing at a
+replication design before the transport under it had been proven.
+
+### The engine
 
 A single-instrument limit order book with price-time priority matching,
 built as a pure state machine:
@@ -49,16 +57,51 @@ red determinism test means stopping rather than continuing.
 every source of non-determinism, what was done about it, and how the
 claim is tested.
 
+### The transport
+
+Length-framed binary messages over TCP, with `poll()` multiplexing,
+static cluster membership from a config file, and graceful handling of
+peers that disappear.
+
+```
+ offset  size  field     notes
+ 0       4     magic     0x544E4553, "SENT"
+ 4       2     version   protocol version
+ 6       2     type      MessageType
+ 8       4     length    payload byte count
+ 12      ...   payload
+```
+
+The length prefix is there because **TCP is a byte stream, not a message
+stream**. One `write()` of 100 bytes can arrive as 30 then 70, or
+coalesced with the next message. TCP preserves byte order and delivery;
+it does not preserve message boundaries, because those were never
+transmitted. So they have to be encoded in the data.
+
+The design decision that mattered: `FrameReader` and `FrameWriter`
+contain **no I/O at all**. They are pure byte-level state machines that
+do not know what a socket is. That is the Phase 1 pure-core discipline
+one layer up, and it means the pathological splits real networks produce
+rarely and unrepeatably can be tested deterministically, one byte at a
+time, with no sockets involved. Four of the five network test binaries
+never open one.
+
+[`docs/wire-protocol.md`](docs/wire-protocol.md) covers the format, the
+untrusted-length defence, the duplicate-connection tiebreak, and why
+`poll()` rather than `epoll()`.
+
 ## Build and run
 
 Requires CMake 3.16+ and a C++20 compiler. No third-party dependencies,
-and nothing is fetched at configure time.
+and nothing is fetched at configure time. The networking layer is POSIX
+only; the engine core builds and is tested everywhere.
 
 ```bash
 make build     # configure and compile
 make test      # run the full ctest suite
 make bench     # single-node baseline benchmark
 make replay    # run the sample order file through the replay driver
+make cluster   # launch a local 3-node cluster
 ```
 
 Or directly:
@@ -143,7 +186,7 @@ order, are in [`docs/domain-model.md`](docs/domain-model.md).
 
 ```
 $ ctest --test-dir build --output-on-failure
-100% tests passed, 0 tests failed out of 10
+100% tests passed, 0 tests failed out of 16
 ```
 
 | Test | Validates |
@@ -158,6 +201,12 @@ $ ctest --test-dir build --output-on-failure
 | `test_determinism` | **The contract.** Golden stream, 50 repeated runs, prefix replay, sensitivity |
 | `test_invariants` | Property-based: 40 seeds, structural invariants after every command, quantity conservation |
 | `replay_sample` | End-to-end byte-identical replay through the real I/O path |
+| `test_wire` | Exact byte layout, round trips, bounds checks, untrusted length caps |
+| `test_message_codec` | Frame headers, round trips, truncation, trailing bytes, out-of-range enums |
+| `test_framing` | **Every chunk size from 1 byte up**, coalesced reads, split headers and bodies, bad magic, bad version, oversized payloads, short writes at every step size |
+| `test_cluster_config` | Config parsing, malformed lines, duplicate ids, port ranges |
+| `test_transport` | Handshake, 4,000-message ordering, duplicate-connection tiebreak, real partial writes, peer death, garbage input, dialing nothing |
+| `two_node_demo` | Two real node processes, end to end |
 
 `test_invariants` alone makes about 224,000 assertions.
 
@@ -195,13 +244,16 @@ and that shows up directly in the measurement.
 ## Layout
 
 ```
-include/sententia/   public headers: types, command, event, order_book, engine
-src/                 the pure core. no I/O, no clock, no threads, no RNG
-apps/replay/         command-file replay driver (the I/O edge)
-bench/               single-node baseline benchmark (the timing edge)
-tests/               one executable per test, plus a ~60-line harness
-scripts/             sample order file and the replay determinism check
-docs/                domain model, determinism contract, phase report
+include/sententia/       engine headers: types, command, event, order_book, engine
+include/sententia/net/   transport headers: wire, message, framing, socket, transport
+src/                     the pure core. no I/O, no clock, no threads, no RNG
+src/net/                 the transport. POSIX sockets and poll()
+apps/replay/             command-file replay driver (the I/O edge)
+apps/node/               cluster node binary
+bench/                   single-node baseline benchmark (the timing edge)
+tests/                   one executable per test, plus a ~60-line harness
+scripts/                 sample orders, cluster configs, demo and determinism checks
+docs/                    domain model, determinism contract, wire protocol, phase reports
 ```
 
 The split between `src/` and everything else is the architecture. Any
@@ -215,8 +267,12 @@ clock, RNG, socket, or file handle belongs on the outside of that line.
 - [`docs/domain-model.md`](docs/domain-model.md) - commands, events,
   matching rules, order lifecycle, validation order, and the omissions
   that were decisions rather than oversights.
-- [`docs/phase-1-report.md`](docs/phase-1-report.md) - Phase 1 checked
-  against its definition of done, with the baseline numbers and the gaps
+- [`docs/wire-protocol.md`](docs/wire-protocol.md) - the frame format,
+  why TCP forces you to frame at all, the untrusted-length defence, the
+  duplicate-connection tiebreak, and poll() versus epoll().
+- [`docs/phase-1-report.md`](docs/phase-1-report.md) and
+  [`docs/phase-2-report.md`](docs/phase-2-report.md) - each phase checked
+  against its definition of done, with the bugs found and the gaps
   carried forward.
 
 ## Roadmap
@@ -225,8 +281,8 @@ clock, RNG, socket, or file handle belongs on the outside of that line.
 |-------|-------------|--------|
 | 0 | Repo, build system, CI, test harness | Done |
 | 1 | Single-node baseline: pure deterministic core, tests | **Done** |
-| 2 | Networking layer: TCP message passing between nodes | Next |
-| 3 | State replication, primary to backup | |
+| 2 | Networking layer: TCP message passing between nodes | **Done** |
+| 3 | State replication, primary to backup | Next |
 | 4 | Leader election | |
 | 5 | Fault-tolerant recovery | |
 | 6 | Benchmarking and hardening | |
@@ -248,8 +304,8 @@ mid-trade. That is the domain trading infrastructure actually runs in.
 
 ## Stack
 
-C++20 · CMake · GCC / Clang / MSVC / Apple Clang · GitHub Actions · zero
-third-party dependencies
+C++20 · CMake · GCC / Clang / MSVC / Apple Clang · POSIX sockets ·
+poll() · GitHub Actions · zero third-party dependencies
 
 ## License
 
