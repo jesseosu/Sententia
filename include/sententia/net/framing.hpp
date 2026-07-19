@@ -78,8 +78,28 @@ const char* toString(FrameReader::Status s) noexcept;
 // wherever it likes and reports back with consume(). That is what makes
 // a short write ordinary rather than exceptional: the kernel took what
 // it took, tell the writer, come back when the socket is writable again.
+// Default cap on unsent bytes per peer. Phase 2 had no cap at all,
+// which was invisible while the only traffic was periodic heartbeats
+// and became a memory leak the moment Phase 3 started replicating every
+// command: measured 65 MB of unsent data and climbing after 2 million
+// commands to a peer that had stopped reading, with bytes actually
+// written flat at 4.26 MB. A primary must not die because a backup got
+// slow. See docs/failure-modes.md.
+constexpr std::size_t kDefaultHighWaterMark = 8u << 20;  // 8 MiB
+
 class FrameWriter {
 public:
+    explicit FrameWriter(std::size_t highWaterMark = kDefaultHighWaterMark) noexcept
+        : highWaterMark_(highWaterMark) {}
+
+    // True when the queue is at or past its cap. The caller decides what
+    // that means: a synchronous replicator refuses new work, an
+    // asynchronous one drops the peer and lets it catch up from the log.
+    // Either way the decision is explicit rather than an allocation.
+    bool overHighWaterMark() const noexcept { return size() >= highWaterMark_; }
+    std::size_t highWaterMark() const noexcept { return highWaterMark_; }
+    void setHighWaterMark(std::size_t bytes) noexcept { highWaterMark_ = bytes; }
+
     void enqueue(const Message& m);
     void enqueueRaw(const Byte* data, std::size_t size);
 
@@ -99,6 +119,7 @@ private:
 
     Buffer buf_;
     std::size_t writePos_{0};
+    std::size_t highWaterMark_{kDefaultHighWaterMark};
 };
 
 }  // namespace sententia::net

@@ -31,6 +31,19 @@
 
 namespace sententia::net {
 
+// Why a send did or did not go through. Phase 2 returned a bare bool,
+// which conflated "no such peer" with "peer is saturated" and left the
+// caller no way to apply backpressure. Replication needs to tell them
+// apart: the first is a routing problem, the second is a flow-control
+// signal that the caller must act on.
+enum class SendResult {
+    Ok,
+    NotConnected,
+    WouldOverflow,
+};
+
+const char* toString(SendResult r) noexcept;
+
 enum class PeerState {
     Disconnected,
     Connecting,   // non-blocking connect in flight
@@ -52,6 +65,7 @@ struct TransportStats {
     std::uint64_t disconnects{0};
     std::uint64_t framingErrors{0};
     std::uint64_t decodeErrors{0};
+    std::uint64_t sendsRefusedOverflow{0};
 };
 
 // One connection. Either dialled by us or accepted from a peer.
@@ -91,12 +105,27 @@ public:
     // immediately. Returns false only on an unrecoverable error.
     bool poll(int timeoutMs);
 
-    // Queues a message. Returns false if the peer is unknown or not
-    // ready. Queuing never blocks; the bytes leave on a later poll().
-    bool send(NodeId to, const Message& m);
+    // Queues a message. Never blocks; the bytes leave on a later poll().
+    // Refuses rather than queueing without bound once the peer's unsent
+    // backlog reaches its high-water mark.
+    SendResult send(NodeId to, const Message& m);
 
     // Queues to every ready peer. Returns how many peers it reached.
     std::size_t broadcast(const Message& m);
+
+    // Unsent bytes queued for a peer, and whether it is saturated. The
+    // replicator polls these to decide whether it may issue more work.
+    std::size_t pendingBytes(NodeId id) const noexcept;
+    bool isSaturated(NodeId id) const noexcept;
+
+    // Applies a high-water mark to every current and future peer.
+    void setHighWaterMark(std::size_t bytes) noexcept;
+
+    // Forcibly drops a peer connection. An outbound peer is redialled
+    // on a later cycle, exactly as if the link had failed. Operationally
+    // this is "force a reconnect"; in tests it is how a network fault is
+    // injected without needing a real one.
+    bool disconnectPeer(NodeId id, const std::string& reason);
 
     void onMessage(MessageHandler h) { onMessage_ = std::move(h); }
     void onPeerUp(PeerEventHandler h) { onPeerUp_ = std::move(h); }
@@ -130,6 +159,7 @@ private:
     std::uint16_t listenPort_{};
     Socket listener_;
     std::vector<std::unique_ptr<Peer>> peers_;
+    std::size_t highWaterMark_{kDefaultHighWaterMark};
     int reconnectDelay_{10};
     int cycle_{0};
     std::vector<int> nextConnectCycle_;

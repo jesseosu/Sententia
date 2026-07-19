@@ -82,7 +82,7 @@ void testHandshakeAndHeartbeat() {
     CHECK_EQ(receivedByB.size(), std::size_t{0});
 
     // A heartbeat crosses and arrives intact.
-    CHECK(a.send(2, Message{Heartbeat{1, 77}}));
+    CHECK(a.send(2, Message{Heartbeat{1, 77}}) == SendResult::Ok);
     CHECK(pump(a, b, [&] { return !receivedByB.empty(); }));
     CHECK_EQ(receivedByB.size(), std::size_t{1});
     if (!receivedByB.empty()) {
@@ -95,7 +95,7 @@ void testHandshakeAndHeartbeat() {
     }
 
     // Sending to a peer that is not connected fails cleanly.
-    CHECK(!a.send(99, Message{Heartbeat{1, 1}}));
+    CHECK(a.send(99, Message{Heartbeat{1, 1}}) == SendResult::NotConnected);
 }
 
 void testManyMessagesPreserveOrder() {
@@ -190,8 +190,8 @@ void testMutualDialProducesOneConnection() {
     CHECK(b.isReady(1));
 
     // And each message crosses exactly once.
-    CHECK(a.send(2, Message{Heartbeat{1, 1}}));
-    CHECK(b.send(1, Message{Heartbeat{2, 1}}));
+    CHECK(a.send(2, Message{Heartbeat{1, 1}}) == SendResult::Ok);
+    CHECK(b.send(1, Message{Heartbeat{2, 1}}) == SendResult::Ok);
     CHECK(pump(a, b, [&] { return !gotByA.empty() && !gotByB.empty(); }));
     for (int i = 0; i < 200; ++i) {
         a.poll(1);
@@ -322,7 +322,7 @@ void testPeerDisconnectIsSurvivable() {
 
     // Still alive and still accepting work: sending to the dead peer
     // fails cleanly instead of crashing or blocking.
-    CHECK(!a.send(2, Message{Heartbeat{1, 1}}));
+    CHECK(a.send(2, Message{Heartbeat{1, 1}}) == SendResult::NotConnected);
     CHECK(a.poll(1));
 }
 

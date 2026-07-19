@@ -14,6 +14,18 @@ constexpr std::size_t kReadChunk = 16 * 1024;
 
 }  // namespace
 
+const char* toString(SendResult r) noexcept {
+    switch (r) {
+        case SendResult::Ok:
+            return "OK";
+        case SendResult::NotConnected:
+            return "NOT_CONNECTED";
+        case SendResult::WouldOverflow:
+            return "WOULD_OVERFLOW";
+    }
+    return "UNKNOWN";
+}
+
 const char* toString(PeerState s) noexcept {
     switch (s) {
         case PeerState::Disconnected:
@@ -60,6 +72,7 @@ void Transport::addPeer(const PeerConfig& cfg) {
     peer->port = cfg.port;
     peer->outbound = true;
     peer->state = PeerState::Disconnected;
+    peer->writer.setHighWaterMark(highWaterMark_);
     peers_.push_back(std::move(peer));
     nextConnectCycle_.push_back(0);
 }
@@ -160,6 +173,7 @@ void Transport::acceptPending() {
         peer->id = 0;  // unknown until Hello arrives
         peer->outbound = false;
         peer->state = PeerState::Handshaking;
+        peer->writer.setHighWaterMark(highWaterMark_);
         peer->sock = std::move(incoming);
         sendHello(*peer);
         peers_.push_back(std::move(peer));
@@ -420,28 +434,72 @@ bool Transport::poll(int timeoutMs) {
     return true;
 }
 
-bool Transport::send(NodeId to, const Message& m) {
+SendResult Transport::send(NodeId to, const Message& m) {
     Peer* peer = findPeer(to);
     if (peer == nullptr) {
-        return false;
+        return SendResult::NotConnected;
+    }
+    // Try to drain first: the backlog may be stale, and refusing a send
+    // because of bytes the kernel would happily take right now would be
+    // backpressure that is not real.
+    handleWritable(*peer);
+    if (!peer->sock.valid()) {
+        return SendResult::NotConnected;
+    }
+    if (peer->writer.overHighWaterMark()) {
+        ++stats_.sendsRefusedOverflow;
+        return SendResult::WouldOverflow;
     }
     peer->writer.enqueue(m);
     ++stats_.messagesSent;
     // Opportunistic write. If the socket is not ready the bytes stay
     // queued and go out on the next poll cycle.
     handleWritable(*peer);
-    return true;
+    return SendResult::Ok;
+}
+
+bool Transport::disconnectPeer(NodeId id, const std::string& reason) {
+    for (auto& p : peers_) {
+        if (p->id == id && p->sock.valid()) {
+            dropPeer(*p, reason);
+            return true;
+        }
+    }
+    return false;
+}
+
+std::size_t Transport::pendingBytes(NodeId id) const noexcept {
+    const Peer* peer = findPeer(id);
+    return peer == nullptr ? 0 : peer->writer.pending();
+}
+
+bool Transport::isSaturated(NodeId id) const noexcept {
+    const Peer* peer = findPeer(id);
+    return peer != nullptr && peer->writer.overHighWaterMark();
+}
+
+void Transport::setHighWaterMark(std::size_t bytes) noexcept {
+    highWaterMark_ = bytes;
+    for (auto& p : peers_) {
+        p->writer.setHighWaterMark(bytes);
+    }
 }
 
 std::size_t Transport::broadcast(const Message& m) {
     std::size_t sent = 0;
     for (auto& p : peers_) {
-        if (p->state == PeerState::Ready) {
-            p->writer.enqueue(m);
-            ++stats_.messagesSent;
-            handleWritable(*p);
-            ++sent;
+        if (p->state != PeerState::Ready) {
+            continue;
         }
+        handleWritable(*p);
+        if (!p->sock.valid() || p->writer.overHighWaterMark()) {
+            ++stats_.sendsRefusedOverflow;
+            continue;
+        }
+        p->writer.enqueue(m);
+        ++stats_.messagesSent;
+        handleWritable(*p);
+        ++sent;
     }
     return sent;
 }
