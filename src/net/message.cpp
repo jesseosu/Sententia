@@ -66,6 +66,12 @@ bool decodeCommand(WireReader& r, Command& out) {
 }
 
 struct TypeVisitor {
+    MessageType operator()(const AppendEntries&) const noexcept {
+        return MessageType::AppendEntries;
+    }
+    MessageType operator()(const AppendResponse&) const noexcept {
+        return MessageType::AppendResponse;
+    }
     MessageType operator()(const Hello&) const noexcept { return MessageType::Hello; }
     MessageType operator()(const Heartbeat&) const noexcept { return MessageType::Heartbeat; }
     MessageType operator()(const CommandForward&) const noexcept {
@@ -97,6 +103,24 @@ struct BodyVisitor {
     void operator()(const EventAck& m) const {
         w.u32(m.nodeId);
         w.u64(m.throughEventSeq);
+        w.u64(m.stateChecksum);
+    }
+
+    void operator()(const AppendEntries& m) const {
+        w.u32(m.leaderId);
+        w.u64(m.prevSeq);
+        w.u64(m.commitSeq);
+        w.u32(static_cast<std::uint32_t>(m.entries.size()));
+        for (const LogRecord& e : m.entries) {
+            w.u64(e.seq);
+            encodeCommand(w, e.command);
+        }
+    }
+
+    void operator()(const AppendResponse& m) const {
+        w.u32(m.nodeId);
+        w.u8(m.ok ? 1 : 0);
+        w.u64(m.lastApplied);
         w.u64(m.stateChecksum);
     }
 };
@@ -174,11 +198,47 @@ std::optional<Message> decodeBody(MessageType type, const Byte* data, std::size_
             }
             return Message{m};
         }
+        case MessageType::AppendEntries: {
+            AppendEntries m;
+            std::uint32_t count = 0;
+            if (!r.u32(m.leaderId) || !r.u64(m.prevSeq) || !r.u64(m.commitSeq) || !r.u32(count)) {
+                return std::nullopt;
+            }
+            // Untrusted count. Cap it before it becomes a reserve, for
+            // the same reason the frame length is capped.
+            if (count > kMaxEntriesPerAppend) {
+                return std::nullopt;
+            }
+            m.entries.reserve(count);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                LogRecord e;
+                if (!r.u64(e.seq) || !decodeCommand(r, e.command)) {
+                    return std::nullopt;
+                }
+                m.entries.push_back(std::move(e));
+            }
+            if (!r.ok() || !r.exhausted()) {
+                return std::nullopt;
+            }
+            return Message{std::move(m)};
+        }
+        case MessageType::AppendResponse: {
+            AppendResponse m;
+            std::uint8_t ok = 0;
+            if (!r.u32(m.nodeId) || !r.u8(ok) || !r.u64(m.lastApplied) || !r.u64(m.stateChecksum) ||
+                !r.ok() || !r.exhausted()) {
+                return std::nullopt;
+            }
+            if (ok > 1) {
+                return std::nullopt;
+            }
+            m.ok = ok == 1;
+            return Message{m};
+        }
+
         // Reserved for later phases: recognised as a type, not yet
         // decodable. Returning nullopt here is correct; the transport
         // reports it as an unhandled type rather than a framing error.
-        case MessageType::AppendEntries:
-        case MessageType::AppendResponse:
         case MessageType::RequestVote:
         case MessageType::VoteResponse:
             return std::nullopt;
@@ -227,6 +287,12 @@ std::string describe(const Message& m) {
                 } else {
                     os << "CANCEL id=" << std::get<CancelOrder>(v.command).id;
                 }
+            } else if constexpr (std::is_same_v<T, AppendEntries>) {
+                os << "leader=" << v.leaderId << " prev=" << v.prevSeq << " commit=" << v.commitSeq
+                   << " entries=" << v.entries.size();
+            } else if constexpr (std::is_same_v<T, AppendResponse>) {
+                os << "node=" << v.nodeId << " ok=" << (v.ok ? "yes" : "no")
+                   << " applied=" << v.lastApplied << " checksum=" << v.stateChecksum;
             } else {
                 os << "node=" << v.nodeId << " through=" << v.throughEventSeq
                    << " checksum=" << v.stateChecksum;

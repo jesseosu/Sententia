@@ -42,20 +42,27 @@ constexpr std::uint32_t kMaxPayload = 1u << 20;  // 1 MiB
 using NodeId = std::uint32_t;
 
 enum class MessageType : std::uint16_t {
-    // In use this phase.
     Hello = 1,
     Heartbeat = 2,
     CommandForward = 3,
     EventAck = 4,
 
-    // Reserved for later phases. Declared now so the type space is
-    // stable and an older node can recognise a message it cannot yet
-    // handle, rather than treating it as a framing error.
-    AppendEntries = 10,   // Phase 3, replication
-    AppendResponse = 11,  // Phase 3
-    RequestVote = 20,     // Phase 4, leader election
-    VoteResponse = 21,    // Phase 4
+    // Phase 3, replication.
+    AppendEntries = 10,
+    AppendResponse = 11,
+
+    // Reserved for Phase 4. Declared now so the type space is stable and
+    // an older node can recognise a message it cannot yet handle, rather
+    // than treating it as a framing error.
+    RequestVote = 20,
+    VoteResponse = 21,
 };
+
+// Cap on entries per AppendEntries message. Bounds the payload well
+// under kMaxPayload and keeps a catch-up burst from monopolising the
+// connection: a backup a million entries behind gets caught up over
+// many messages, interleaved with everything else.
+constexpr std::size_t kMaxEntriesPerAppend = 512;
 
 // Sent immediately on connect so each side learns who the other is.
 struct Hello {
@@ -98,7 +105,48 @@ struct EventAck {
     friend bool operator==(const EventAck&, const EventAck&) = default;
 };
 
-using Message = std::variant<Hello, Heartbeat, CommandForward, EventAck>;
+// One command with the sequence number the primary assigned it. The
+// sequence is what the two nodes agree on; the command is unchanged from
+// Phase 1, which is why forwarding it needs no reconciliation.
+struct LogRecord {
+    std::uint64_t seq{};
+    Command command{};
+
+    friend bool operator==(const LogRecord&, const LogRecord&) = default;
+};
+
+// The primary replicating commands to a backup.
+//
+// `prevSeq` is the sequence the backup must already have applied for
+// these entries to follow on. If it does not match, the backup has a gap
+// and says so rather than applying out of order, which would break the
+// determinism contract silently and unrecoverably.
+//
+// An empty `entries` list is a probe: it is how a primary discovers
+// where a freshly reconnected backup got to.
+struct AppendEntries {
+    NodeId leaderId{};
+    std::uint64_t prevSeq{};
+    std::uint64_t commitSeq{};
+    std::vector<LogRecord> entries;
+
+    friend bool operator==(const AppendEntries&, const AppendEntries&) = default;
+};
+
+// The backup's answer. `ok` false means "I have a gap, resend from
+// lastApplied + 1". The checksum lets the primary detect divergence
+// cheaply, without ever shipping a book.
+struct AppendResponse {
+    NodeId nodeId{};
+    bool ok{false};
+    std::uint64_t lastApplied{};
+    std::uint64_t stateChecksum{};
+
+    friend bool operator==(const AppendResponse&, const AppendResponse&) = default;
+};
+
+using Message =
+    std::variant<Hello, Heartbeat, CommandForward, EventAck, AppendEntries, AppendResponse>;
 
 MessageType typeOf(const Message& m) noexcept;
 
