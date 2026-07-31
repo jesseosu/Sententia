@@ -1,22 +1,29 @@
 // Sententia - cluster node.
 //
-// The two-node heartbeat demo, and the skeleton every later phase grows
-// into. It starts a transport, connects to its configured peers, and
-// exchanges heartbeats, logging every message.
+// A node owns a matching engine, a command log, a transport, and a
+// replicator. A primary accepts commands from an order file and
+// replicates them; a backup applies whatever the primary sends.
 //
-// The matching engine is deliberately absent. Wiring it in is Phase 3's
-// job, and doing it now would mean guessing at a replication design
-// before the transport it runs on has been proven.
+// The demo worth running: start a backup, then a primary pointed at the
+// same order file the single-process replay driver uses, and watch both
+// print the same state checksum at the end. Neither ever sent the other
+// a book.
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
+#include <vector>
 
 #include "sententia/net/cluster_config.hpp"
 #include "sententia/net/transport.hpp"
+#include "sententia/replication/replicator.hpp"
 
+using namespace sententia;
 using namespace sententia::net;
+using namespace sententia::replication;
 
 namespace {
 
@@ -28,17 +35,112 @@ void onSignal(int) {
 
 void usage(const char* argv0) {
     std::cerr << "usage: " << argv0 << " --id <node-id> --config <cluster.conf>\n"
-              << "                    [--heartbeat-cycles N] [--max-cycles N] [--quiet]\n";
+              << "  [--role primary|backup]   default backup\n"
+              << "  [--mode sync|async]       default sync\n"
+              << "  [--orders <file>]         primary: replicate this order file\n"
+              << "  [--sync-window N]         default 8\n"
+              << "  [--heartbeat-cycles N]    default 20, 0 disables\n"
+              << "  [--max-cycles N]          safety net: exit after N poll cycles\n"
+              << "  [--exit-on-complete]      exit when the work is actually done\n"
+              << "  [--quiet]\n";
 }
+
+bool parseSide(const std::string& s, Side& out) {
+    if (s == "BUY" || s == "B") {
+        out = Side::Buy;
+        return true;
+    }
+    if (s == "SELL" || s == "S") {
+        out = Side::Sell;
+        return true;
+    }
+    return false;
+}
+bool parseType(const std::string& s, OrderType& out) {
+    if (s == "LIMIT" || s == "L") {
+        out = OrderType::Limit;
+        return true;
+    }
+    if (s == "MARKET" || s == "M") {
+        out = OrderType::Market;
+        return true;
+    }
+    return false;
+}
+bool parseTif(const std::string& s, TimeInForce& out) {
+    if (s == "GTC") {
+        out = TimeInForce::GoodTillCancel;
+        return true;
+    }
+    if (s == "IOC") {
+        out = TimeInForce::ImmediateOrCancel;
+        return true;
+    }
+    return false;
+}
+
+// Same format as the replay driver, so the same file drives both.
+bool loadOrders(const std::string& path, InstrumentId instrument, std::vector<Command>& out,
+                std::string& error) {
+    std::ifstream file(path);
+    if (!file) {
+        error = "cannot open " + path;
+        return false;
+    }
+    std::string raw;
+    std::size_t lineNo = 0;
+    while (std::getline(file, raw)) {
+        ++lineNo;
+        const auto hash = raw.find('#');
+        if (hash != std::string::npos) {
+            raw.erase(hash);
+        }
+        std::istringstream line(raw);
+        std::string kind;
+        if (!(line >> kind)) {
+            continue;
+        }
+        if (kind == "N" || kind == "NEW") {
+            NewOrder o;
+            std::string sideText, typeText, tifText;
+            if (!(line >> o.id >> sideText >> typeText >> tifText >> o.price >> o.quantity) ||
+                !parseSide(sideText, o.side) || !parseType(typeText, o.type) ||
+                !parseTif(tifText, o.tif)) {
+                error = path + ":" + std::to_string(lineNo) + ": malformed order";
+                return false;
+            }
+            o.instrument = instrument;
+            out.push_back(o);
+        } else if (kind == "C" || kind == "CANCEL") {
+            CancelOrder c;
+            if (!(line >> c.id)) {
+                error = path + ":" + std::to_string(lineNo) + ": malformed cancel";
+                return false;
+            }
+            out.push_back(c);
+        } else {
+            error = path + ":" + std::to_string(lineNo) + ": unknown command " + kind;
+            return false;
+        }
+    }
+    return true;
+}
+
+constexpr InstrumentId kInstrument = 1;
 
 }  // namespace
 
 int main(int argc, char** argv) {
     NodeId selfId = 0;
     std::string configPath;
-    int heartbeatCycles = 10;
+    std::string ordersPath;
+    Role role = Role::Backup;
+    ReplicationMode mode = ReplicationMode::Synchronous;
+    std::size_t syncWindow = 8;
+    int heartbeatCycles = 20;
     long maxCycles = -1;
     bool quiet = false;
+    bool exitOnComplete = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -46,10 +148,36 @@ int main(int argc, char** argv) {
             selfId = static_cast<NodeId>(std::strtoul(argv[++i], nullptr, 10));
         } else if (arg == "--config" && i + 1 < argc) {
             configPath = argv[++i];
+        } else if (arg == "--orders" && i + 1 < argc) {
+            ordersPath = argv[++i];
+        } else if (arg == "--role" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v == "primary") {
+                role = Role::Primary;
+            } else if (v == "backup") {
+                role = Role::Backup;
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (arg == "--mode" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v == "sync") {
+                mode = ReplicationMode::Synchronous;
+            } else if (v == "async") {
+                mode = ReplicationMode::Asynchronous;
+            } else {
+                usage(argv[0]);
+                return 2;
+            }
+        } else if (arg == "--sync-window" && i + 1 < argc) {
+            syncWindow = std::strtoull(argv[++i], nullptr, 10);
         } else if (arg == "--heartbeat-cycles" && i + 1 < argc) {
             heartbeatCycles = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
         } else if (arg == "--max-cycles" && i + 1 < argc) {
             maxCycles = std::strtol(argv[++i], nullptr, 10);
+        } else if (arg == "--exit-on-complete") {
+            exitOnComplete = true;
         } else if (arg == "--quiet") {
             quiet = true;
         } else {
@@ -69,31 +197,59 @@ int main(int argc, char** argv) {
         std::cerr << configPath << ":" << configError.line << ": " << configError.message << "\n";
         return 1;
     }
-
     const PeerConfig* self = config->find(selfId);
     if (self == nullptr) {
         std::cerr << "node id " << selfId << " is not in " << configPath << "\n";
         return 1;
     }
 
+    std::vector<Command> orders;
+    if (!ordersPath.empty()) {
+        std::string error;
+        if (!loadOrders(ordersPath, kInstrument, orders, error)) {
+            std::cerr << error << "\n";
+            return 1;
+        }
+    }
+
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
+    MatchingEngine engine(kInstrument);
+    CommandLog log;
     Transport transport(selfId, self->port);
+    Replicator replicator(selfId, role, mode, engine, log, transport);
+    replicator.setSyncWindow(syncWindow);
+
+    const auto tag = [selfId, role] {
+        return "[" + std::string(toString(role)) + " " + std::to_string(selfId) + "] ";
+    };
+
     if (!quiet) {
-        transport.onLog([selfId](const std::string& msg) {
-            std::cout << "[node " << selfId << "] " << msg << std::endl;
-        });
+        transport.onLog([&](const std::string& m) { std::cout << tag() << m << std::endl; });
+        replicator.onLog([&](const std::string& m) { std::cout << tag() << m << std::endl; });
     }
-    transport.onPeerUp([selfId](NodeId id, const std::string& addr) {
-        std::cout << "[node " << selfId << "] PEER UP " << id << " at " << addr << std::endl;
+    transport.onPeerUp([&](NodeId id, const std::string& addr) {
+        std::cout << tag() << "PEER UP " << id << " at " << addr << std::endl;
+        replicator.onPeerUp(id);
     });
-    transport.onPeerDown([selfId](NodeId id, const std::string& why) {
-        std::cout << "[node " << selfId << "] PEER DOWN " << id << ": " << why << std::endl;
+    transport.onPeerDown([&](NodeId id, const std::string& why) {
+        std::cout << tag() << "PEER DOWN " << id << ": " << why << std::endl;
+        replicator.onPeerDown(id);
     });
-    transport.onMessage([selfId](NodeId from, const Message& m) {
-        std::cout << "[node " << selfId << "] RECV from " << from << ": " << describe(m)
-                  << std::endl;
+    transport.onMessage([&](NodeId from, const Message& m) {
+        // Replication traffic goes to the replicator; anything else is
+        // logged. Heartbeats fall in the second group, which is what
+        // keeps the Phase 2 two-node demo meaningful now that this
+        // binary also does replication.
+        const MessageType type = typeOf(m);
+        if (type == MessageType::AppendEntries || type == MessageType::AppendResponse) {
+            replicator.onMessage(from, m);
+            return;
+        }
+        if (!quiet) {
+            std::cout << tag() << "RECV from " << from << ": " << describe(m) << std::endl;
+        }
     });
 
     std::string error;
@@ -103,33 +259,88 @@ int main(int argc, char** argv) {
     }
     transport.addPeers(config->others(selfId));
 
+    std::cout << tag() << "mode=" << toString(mode) << " sync_window=" << syncWindow
+              << " orders=" << orders.size() << std::endl;
+
+    std::size_t nextOrder = 0;
     std::uint64_t heartbeatCounter = 0;
     long cycles = 0;
+    bool everConnected = false;
+    bool complete = false;
 
-    while (g_stop == 0 && (maxCycles < 0 || cycles < maxCycles)) {
-        if (!transport.poll(100)) {
-            std::cerr << "poll failed\n";
-            return 1;
-        }
+    while (g_stop == 0 && !complete && (maxCycles < 0 || cycles < maxCycles)) {
+        transport.poll(10);
+        replicator.tick();
         ++cycles;
+
+        // Feed the order file through as the primary. Busy is normal
+        // backpressure, so the order is simply retried next cycle.
+        if (role == Role::Primary && nextOrder < orders.size()) {
+            for (int burst = 0; burst < 256 && nextOrder < orders.size(); ++burst) {
+                const SubmitResult r = replicator.submit(orders[nextOrder]);
+                if (!r.ok()) {
+                    break;
+                }
+                ++nextOrder;
+            }
+            if (nextOrder == orders.size()) {
+                std::cout << tag() << "all " << orders.size() << " orders submitted" << std::endl;
+            }
+        }
+
         if (heartbeatCycles > 0 && cycles % heartbeatCycles == 0) {
             Heartbeat hb;
             hb.nodeId = selfId;
             hb.counter = ++heartbeatCounter;
             transport.broadcast(Message{hb});
         }
+
+        // Exit on the work being finished rather than on a cycle budget.
+        //
+        // A fixed --max-cycles budget can run out before convergence on
+        // a loaded machine, which makes a demo that is really a test
+        // fail for reasons unrelated to the code. That is the same
+        // mistake as asserting a short write on loopback: bounding a
+        // test by something the environment controls. The budget stays
+        // as a safety net so nothing can hang, but it is no longer what
+        // normally ends the run.
+        if (transport.readyPeerCount() > 0) {
+            everConnected = true;
+        }
+        if (exitOnComplete) {
+            if (role == Role::Primary) {
+                // Everything submitted, applied locally, and confirmed
+                // held by every backup.
+                complete = everConnected && nextOrder == orders.size() &&
+                           replicator.lastApplied() == log.lastSeq() &&
+                           replicator.commitSeq() == log.lastSeq() && log.lastSeq() > 0;
+            } else {
+                // The primary finished and went away.
+                complete = everConnected && transport.readyPeerCount() == 0;
+            }
+        }
     }
 
-    const TransportStats& s = transport.stats();
-    std::cout << "[node " << selfId << "] shutting down\n"
-              << "  messages_sent=" << s.messagesSent << "\n"
-              << "  messages_received=" << s.messagesReceived << "\n"
-              << "  bytes_sent=" << s.bytesSent << "\n"
-              << "  bytes_received=" << s.bytesReceived << "\n"
-              << "  short_writes=" << s.shortWrites << "\n"
-              << "  connections_accepted=" << s.connectionsAccepted << "\n"
-              << "  connections_established=" << s.connectionsEstablished << "\n"
-              << "  disconnects=" << s.disconnects << "\n"
-              << "  framing_errors=" << s.framingErrors << std::endl;
+    const ReplicationStats& rs = replicator.stats();
+    const TransportStats& ts = transport.stats();
+    std::cout << tag() << "shutting down\n"
+              << "  role=" << toString(role) << " mode=" << toString(mode) << "\n"
+              << "  last_applied=" << replicator.lastApplied() << "\n"
+              << "  commit_seq=" << replicator.commitSeq() << "\n"
+              << "  log_last_seq=" << log.lastSeq() << "\n"
+              << "  submitted=" << rs.submitted << "\n"
+              << "  applied=" << rs.applied << "\n"
+              << "  entries_sent=" << rs.entriesSent << "\n"
+              << "  entries_received=" << rs.entriesReceived << "\n"
+              << "  gaps_detected=" << rs.gapsDetected << "\n"
+              << "  checksum_mismatches=" << rs.checksumMismatches << "\n"
+              << "  resting_orders=" << engine.book().orderCount() << "\n"
+              << "  messages_sent=" << ts.messagesSent << "\n"
+              << "  messages_received=" << ts.messagesReceived << "\n"
+              << "  bytes_sent=" << ts.bytesSent << "\n"
+              << "  sends_refused_overflow=" << ts.sendsRefusedOverflow << "\n"
+              << "  disconnects=" << ts.disconnects << "\n"
+              << "  framing_errors=" << ts.framingErrors << "\n"
+              << "  state_checksum=" << engine.stateChecksum() << std::endl;
     return 0;
 }

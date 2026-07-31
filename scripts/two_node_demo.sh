@@ -7,11 +7,23 @@
 # waiting on a process that never dies.
 set -uo pipefail
 
-NODE="${1:?usage: two_node_demo.sh <node-binary> <config>}"
-CONFIG="${2:?usage: two_node_demo.sh <node-binary> <config>}"
+NODE="${1:?usage: two_node_demo.sh <node-binary>}"
 
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
+
+# Fixed ports collide when two runs overlap: a Release ctest and a Debug
+# ctest on the same machine, or a re-run starting before the previous
+# run's processes have exited. Derive a port base from the PID so
+# concurrent runs cannot land on the same ports. Unit tests avoid this
+# entirely by binding port 0 and letting the kernel choose, but the demo
+# needs a config file with real port numbers in it.
+PORT_BASE=$(( 20000 + (($$ * 7) % 30000) ))
+CONFIG="$OUT/cluster.conf"
+{
+    echo "node 1 127.0.0.1 $PORT_BASE"
+    echo "node 2 127.0.0.1 $((PORT_BASE + 1))"
+} > "$CONFIG"
 
 "$NODE" --id 1 --config "$CONFIG" --heartbeat-cycles 5 --max-cycles 100 > "$OUT/n1.log" 2>&1 &
 P1=$!
