@@ -7,18 +7,23 @@ deterministic recovery from node failure, extending the single-process
 [Celeritas](https://github.com/jesseosu/celeritas) engine into a
 clustered, crash-resilient system.
 
-**Status: Phase 2 complete.** The single-node core is pure and
-deterministic, and nodes can now talk to each other over TCP. Replication
-starts in Phase 3.
+**Status: Phase 3 complete.** A primary replicates its order book to a
+backup by shipping commands, not state, and the backup converges to a
+byte-identical book even after arbitrary link failure. Leader election is
+Phase 4.
 
 ---
 
 ## What exists today
 
-**A deterministic matching engine** (Phase 1) and **a message transport
-that connects nodes over TCP** (Phase 2). They are not wired together
-yet: that is Phase 3's job, and doing it earlier would mean guessing at a
-replication design before the transport under it had been proven.
+**A deterministic matching engine** (Phase 1), **a framed TCP transport**
+(Phase 2), and **state-machine replication** on top of both (Phase 3).
+
+The end-to-end proof that it works is a single number. Replaying the same
+order file through the single-process driver, through a synchronous
+primary/backup pair, and through an asynchronous one all produce the
+state checksum `17373410596180621386`. Neither node ever sent the other a
+book.
 
 ### The engine
 
@@ -90,6 +95,49 @@ never open one.
 untrusted-length defence, the duplicate-connection tiebreak, and why
 `poll()` rather than `epoll()`.
 
+### Replication
+
+A backup needs the same book as the primary. Shipping the book costs
+megabytes per order and gets more expensive exactly when the venue is
+busiest. So the primary ships **commands** instead, and the backup
+computes the book itself. Measured: **72.6 bytes per command, flat,
+regardless of book depth.**
+
+That only works because the engine is deterministic, which is why Phase 1
+came first and why its determinism test gates everything here. This is
+state-machine replication, the idea underneath Raft and Paxos and every
+database that replicates its write-ahead log.
+
+Both acknowledgement modes are implemented, because the tradeoff is worth
+being able to measure. 20,000 commands, two nodes over loopback:
+
+| Mode | In flight | Throughput | Submit p50 |
+|------|-----------|-----------|-----------|
+| Synchronous | 1 | 8,183 cmd/s | 61,325 ns |
+| Synchronous | 8 | 8,264 cmd/s | 2,447 ns |
+| Synchronous | 64 | 8,277 cmd/s | 2,432 ns |
+| Asynchronous | unbounded | 15,692 cmd/s | 2,787 ns |
+
+Consistency costs about 1.9x throughput. The more interesting row is the
+window: strict lockstep makes the caller wait 61 microseconds per
+command, and allowing eight in flight drops that 25x while throughput
+barely moves. Pipelining does not weaken the guarantee, it stops the
+guarantee being paid for in caller-visible latency. What it costs is
+crash exposure.
+
+[`docs/replication.md`](docs/replication.md) covers the model, sequencing,
+catch-up, backpressure, and divergence detection.
+
+```bash
+./scripts/replication_demo.sh ./build/node \
+    scripts/sample_orders.txt sync
+```
+```
+replication demo OK (mode=sync)
+  commands applied on both nodes: 12
+  state checksum on both nodes:   17373410596180621386
+```
+
 ## Build and run
 
 Requires CMake 3.16+ and a C++20 compiler. No third-party dependencies,
@@ -102,6 +150,7 @@ make test      # run the full ctest suite
 make bench     # single-node baseline benchmark
 make replay    # run the sample order file through the replay driver
 make cluster   # launch a local 3-node cluster
+make replbench # synchronous vs asynchronous replication benchmark
 ```
 
 Or directly:
@@ -186,7 +235,7 @@ order, are in [`docs/domain-model.md`](docs/domain-model.md).
 
 ```
 $ ctest --test-dir build --output-on-failure
-100% tests passed, 0 tests failed out of 16
+100% tests passed, 0 tests failed out of 22
 ```
 
 | Test | Validates |
@@ -207,6 +256,11 @@ $ ctest --test-dir build --output-on-failure
 | `test_cluster_config` | Config parsing, malformed lines, duplicate ids, port ranges |
 | `test_transport` | Handshake, 4,000-message ordering, duplicate-connection tiebreak, real partial writes, peer death, garbage input, dialing nothing |
 | `two_node_demo` | Two real node processes, end to end |
+| `test_backpressure` | Bounded outbound queue, refusal reported, recovery when the peer resumes |
+| `test_command_log` | Sequencing, gap refusal, range serving, truncation |
+| `test_replication` | Sync and async convergence, commit semantics, gap detection, **message amplification**, full catch-up from zero, compaction |
+| `test_replication_chaos` | Convergence under repeated link failure, 4 seeds x 4 drop rates |
+| `replication_demo_sync` / `_async` | Two real processes reaching identical checksums |
 
 `test_invariants` alone makes about 224,000 assertions.
 
@@ -246,10 +300,12 @@ and that shows up directly in the measurement.
 ```
 include/sententia/       engine headers: types, command, event, order_book, engine
 include/sententia/net/   transport headers: wire, message, framing, socket, transport
+include/sententia/replication/  command log and replicator
 src/                     the pure core. no I/O, no clock, no threads, no RNG
 src/net/                 the transport. POSIX sockets and poll()
+src/replication/         state-machine replication
 apps/replay/             command-file replay driver (the I/O edge)
-apps/node/               cluster node binary
+apps/node/               cluster node binary: engine + log + transport + replicator
 bench/                   single-node baseline benchmark (the timing edge)
 tests/                   one executable per test, plus a ~60-line harness
 scripts/                 sample orders, cluster configs, demo and determinism checks
@@ -270,10 +326,16 @@ clock, RNG, socket, or file handle belongs on the outside of that line.
 - [`docs/wire-protocol.md`](docs/wire-protocol.md) - the frame format,
   why TCP forces you to frame at all, the untrusted-length defence, the
   duplicate-connection tiebreak, and poll() versus epoll().
-- [`docs/phase-1-report.md`](docs/phase-1-report.md) and
-  [`docs/phase-2-report.md`](docs/phase-2-report.md) - each phase checked
-  against its definition of done, with the bugs found and the gaps
-  carried forward.
+- [`docs/replication.md`](docs/replication.md) - shipping commands rather
+  than state, sequencing, the acknowledgement tradeoff with numbers,
+  backpressure, catch-up, and divergence detection.
+- [`docs/failure-modes.md`](docs/failure-modes.md) - a running catalogue
+  of every bug and near-miss, with symptom, cause, fix, and what catches
+  it now. Worth reading before the phase reports.
+- [`docs/phase-1-report.md`](docs/phase-1-report.md),
+  [`docs/phase-2-report.md`](docs/phase-2-report.md) and
+  [`docs/phase-3-report.md`](docs/phase-3-report.md) - each phase checked
+  against its definition of done, with the gaps carried forward.
 
 ## Roadmap
 
@@ -282,8 +344,8 @@ clock, RNG, socket, or file handle belongs on the outside of that line.
 | 0 | Repo, build system, CI, test harness | Done |
 | 1 | Single-node baseline: pure deterministic core, tests | **Done** |
 | 2 | Networking layer: TCP message passing between nodes | **Done** |
-| 3 | State replication, primary to backup | Next |
-| 4 | Leader election | |
+| 3 | State replication, primary to backup | **Done** |
+| 4 | Leader election | Next |
 | 5 | Fault-tolerant recovery | |
 | 6 | Benchmarking and hardening | |
 | 7 | Documentation and writeup | |
