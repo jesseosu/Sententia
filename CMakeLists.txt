@@ -47,12 +47,17 @@ if(UNIX)
         src/net/framing.cpp
         src/net/socket.cpp
         src/net/cluster_config.cpp
-        src/net/transport.cpp)
+        src/net/transport.cpp
+        src/replication/command_log.cpp
+        src/replication/replicator.cpp)
     target_include_directories(sententia_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(sententia_net PUBLIC sententia_core PRIVATE sententia_flags)
 
     add_executable(node apps/node/main.cpp)
     target_link_libraries(node PRIVATE sententia_net sententia_flags)
+
+    add_executable(replication_bench bench/replication_bench.cpp)
+    target_link_libraries(replication_bench PRIVATE sententia_net sententia_flags)
 endif()
 
 add_executable(replay apps/replay/main.cpp)
@@ -83,7 +88,11 @@ set(SENTENTIA_NET_TESTS
     test_message_codec
     test_framing
     test_cluster_config
-    test_transport)
+    test_transport
+    test_backpressure
+    test_command_log
+    test_replication
+    test_replication_chaos)
 
 foreach(test_name IN LISTS SENTENTIA_TESTS)
     add_executable(${test_name} tests/${test_name}.cpp)
@@ -103,9 +112,19 @@ if(UNIX)
     # Two real node processes exchange heartbeats and shut down cleanly.
     add_test(NAME two_node_demo
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/two_node_demo.sh
-                     $<TARGET_FILE:node>
-                     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/cluster_demo.conf)
+                     $<TARGET_FILE:node>)
     set_tests_properties(two_node_demo PROPERTIES TIMEOUT 60)
+
+    # A primary replicates an order file to a backup and both end at the
+    # same state checksum, in each acknowledgement mode.
+    foreach(repl_mode IN ITEMS sync async)
+        add_test(NAME replication_demo_${repl_mode}
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/replication_demo.sh
+                         $<TARGET_FILE:node>
+                         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/sample_orders.txt
+                         ${repl_mode})
+        set_tests_properties(replication_demo_${repl_mode} PROPERTIES TIMEOUT 90)
+    endforeach()
 endif()
 
 # Replaying the sample order file twice must produce identical output.
