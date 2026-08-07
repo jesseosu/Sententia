@@ -66,6 +66,8 @@ bool decodeCommand(WireReader& r, Command& out) {
 }
 
 struct TypeVisitor {
+    MessageType operator()(const RequestVote&) const noexcept { return MessageType::RequestVote; }
+    MessageType operator()(const VoteResponse&) const noexcept { return MessageType::VoteResponse; }
     MessageType operator()(const AppendEntries&) const noexcept {
         return MessageType::AppendEntries;
     }
@@ -106,7 +108,20 @@ struct BodyVisitor {
         w.u64(m.stateChecksum);
     }
 
+    void operator()(const RequestVote& m) const {
+        w.u64(m.term);
+        w.u32(m.candidateId);
+        w.u64(m.lastLogSeq);
+    }
+
+    void operator()(const VoteResponse& m) const {
+        w.u64(m.term);
+        w.u32(m.voterId);
+        w.u8(m.granted ? 1 : 0);
+    }
+
     void operator()(const AppendEntries& m) const {
+        w.u64(m.term);
         w.u32(m.leaderId);
         w.u64(m.prevSeq);
         w.u64(m.commitSeq);
@@ -118,6 +133,7 @@ struct BodyVisitor {
     }
 
     void operator()(const AppendResponse& m) const {
+        w.u64(m.term);
         w.u32(m.nodeId);
         w.u8(m.ok ? 1 : 0);
         w.u64(m.lastApplied);
@@ -201,7 +217,8 @@ std::optional<Message> decodeBody(MessageType type, const Byte* data, std::size_
         case MessageType::AppendEntries: {
             AppendEntries m;
             std::uint32_t count = 0;
-            if (!r.u32(m.leaderId) || !r.u64(m.prevSeq) || !r.u64(m.commitSeq) || !r.u32(count)) {
+            if (!r.u64(m.term) || !r.u32(m.leaderId) || !r.u64(m.prevSeq) || !r.u64(m.commitSeq) ||
+                !r.u32(count)) {
                 return std::nullopt;
             }
             // Untrusted count. Cap it before it becomes a reserve, for
@@ -225,8 +242,8 @@ std::optional<Message> decodeBody(MessageType type, const Byte* data, std::size_
         case MessageType::AppendResponse: {
             AppendResponse m;
             std::uint8_t ok = 0;
-            if (!r.u32(m.nodeId) || !r.u8(ok) || !r.u64(m.lastApplied) || !r.u64(m.stateChecksum) ||
-                !r.ok() || !r.exhausted()) {
+            if (!r.u64(m.term) || !r.u32(m.nodeId) || !r.u8(ok) || !r.u64(m.lastApplied) ||
+                !r.u64(m.stateChecksum) || !r.ok() || !r.exhausted()) {
                 return std::nullopt;
             }
             if (ok > 1) {
@@ -236,12 +253,27 @@ std::optional<Message> decodeBody(MessageType type, const Byte* data, std::size_
             return Message{m};
         }
 
-        // Reserved for later phases: recognised as a type, not yet
-        // decodable. Returning nullopt here is correct; the transport
-        // reports it as an unhandled type rather than a framing error.
-        case MessageType::RequestVote:
-        case MessageType::VoteResponse:
-            return std::nullopt;
+        case MessageType::RequestVote: {
+            RequestVote m;
+            if (!r.u64(m.term) || !r.u32(m.candidateId) || !r.u64(m.lastLogSeq) || !r.ok() ||
+                !r.exhausted()) {
+                return std::nullopt;
+            }
+            return Message{m};
+        }
+        case MessageType::VoteResponse: {
+            VoteResponse m;
+            std::uint8_t granted = 0;
+            if (!r.u64(m.term) || !r.u32(m.voterId) || !r.u8(granted) || !r.ok() ||
+                !r.exhausted()) {
+                return std::nullopt;
+            }
+            if (granted > 1) {
+                return std::nullopt;
+            }
+            m.granted = granted == 1;
+            return Message{m};
+        }
     }
     return std::nullopt;
 }
@@ -287,9 +319,15 @@ std::string describe(const Message& m) {
                 } else {
                     os << "CANCEL id=" << std::get<CancelOrder>(v.command).id;
                 }
+            } else if constexpr (std::is_same_v<T, RequestVote>) {
+                os << "term=" << v.term << " candidate=" << v.candidateId
+                   << " lastLogSeq=" << v.lastLogSeq;
+            } else if constexpr (std::is_same_v<T, VoteResponse>) {
+                os << "term=" << v.term << " voter=" << v.voterId
+                   << " granted=" << (v.granted ? "yes" : "no");
             } else if constexpr (std::is_same_v<T, AppendEntries>) {
-                os << "leader=" << v.leaderId << " prev=" << v.prevSeq << " commit=" << v.commitSeq
-                   << " entries=" << v.entries.size();
+                os << "term=" << v.term << " leader=" << v.leaderId << " prev=" << v.prevSeq
+                   << " commit=" << v.commitSeq << " entries=" << v.entries.size();
             } else if constexpr (std::is_same_v<T, AppendResponse>) {
                 os << "node=" << v.nodeId << " ok=" << (v.ok ? "yes" : "no")
                    << " applied=" << v.lastApplied << " checksum=" << v.stateChecksum;

@@ -51,9 +51,7 @@ enum class MessageType : std::uint16_t {
     AppendEntries = 10,
     AppendResponse = 11,
 
-    // Reserved for Phase 4. Declared now so the type space is stable and
-    // an older node can recognise a message it cannot yet handle, rather
-    // than treating it as a framing error.
+    // Phase 4, leader election.
     RequestVote = 20,
     VoteResponse = 21,
 };
@@ -125,6 +123,11 @@ struct LogRecord {
 // An empty `entries` list is a probe: it is how a primary discovers
 // where a freshly reconnected backup got to.
 struct AppendEntries {
+    // The leader's term. A follower that sees a higher term than its own
+    // adopts it and steps down; a leader that sees one stops being
+    // leader. This single field is what makes a stale leader harmless:
+    // its messages are ignored by anyone who has moved on.
+    std::uint64_t term{};
     NodeId leaderId{};
     std::uint64_t prevSeq{};
     std::uint64_t commitSeq{};
@@ -137,6 +140,7 @@ struct AppendEntries {
 // lastApplied + 1". The checksum lets the primary detect divergence
 // cheaply, without ever shipping a book.
 struct AppendResponse {
+    std::uint64_t term{};
     NodeId nodeId{};
     bool ok{false};
     std::uint64_t lastApplied{};
@@ -145,8 +149,33 @@ struct AppendResponse {
     friend bool operator==(const AppendResponse&, const AppendResponse&) = default;
 };
 
-using Message =
-    std::variant<Hello, Heartbeat, CommandForward, EventAck, AppendEntries, AppendResponse>;
+// A candidate asking to be made leader for `term`.
+//
+// `lastLogSeq` is the election restriction, and it is the subtle part.
+// A voter refuses a candidate whose log is behind its own, because a
+// leader missing entries that were already committed elsewhere would
+// silently drop them. Majority voting alone does not prevent that; this
+// check is what does.
+struct RequestVote {
+    std::uint64_t term{};
+    NodeId candidateId{};
+    std::uint64_t lastLogSeq{};
+
+    friend bool operator==(const RequestVote&, const RequestVote&) = default;
+};
+
+// A vote, or a refusal. The term is carried so a candidate learns it has
+// been superseded even when the answer is no.
+struct VoteResponse {
+    std::uint64_t term{};
+    NodeId voterId{};
+    bool granted{false};
+
+    friend bool operator==(const VoteResponse&, const VoteResponse&) = default;
+};
+
+using Message = std::variant<Hello, Heartbeat, CommandForward, EventAck, AppendEntries,
+                             AppendResponse, RequestVote, VoteResponse>;
 
 MessageType typeOf(const Message& m) noexcept;
 

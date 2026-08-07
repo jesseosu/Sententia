@@ -43,6 +43,26 @@ void roundTrip(const T& original) {
 }
 
 void run() {
+    // Every message type round-trips. AppendEntries and AppendResponse
+    // were added in Phase 3 without round-trip coverage, and when a
+    // `term` field was added to both in Phase 4 the encoder was updated
+    // and the decoder was not. The result was that every AppendResponse
+    // silently failed to decode and was dropped, so replication stopped
+    // dead. A round-trip here would have caught it in seconds.
+    roundTrip(AppendEntries{3, 1, 10, 5, {}});
+    roundTrip(AppendEntries{7,
+                            2,
+                            0,
+                            0,
+                            {LogRecord{1, Command{support::limit(1, Side::Buy, 100, 5)}},
+                             LogRecord{2, Command{support::cancel(1)}}}});
+    roundTrip(AppendResponse{4, 2, true, 99, 123456789});
+    roundTrip(AppendResponse{0, 5, false, 0, 0});
+    roundTrip(RequestVote{9, 3, 4242});
+    roundTrip(RequestVote{0, 1, 0});
+    roundTrip(VoteResponse{9, 2, true});
+    roundTrip(VoteResponse{9, 2, false});
+
     roundTrip(Hello{7, kVersion, "127.0.0.1:7101"});
     roundTrip(Hello{1, kVersion, ""});
     roundTrip(Heartbeat{3, 0});
@@ -125,12 +145,37 @@ void run() {
         CHECK(!decoded.has_value());
     }
 
-    // Types reserved for later phases decode to nothing today, which
-    // the transport reports without dropping the connection.
+    // A guard against the gap that caused the bug above: every message
+    // type in the variant must be exercised by a round trip. If a new
+    // one is added to the variant, this count changes and the assertion
+    // below fails until coverage is added for it.
     {
-        const Byte empty[1] = {0};
-        CHECK(!decodeBody(MessageType::RequestVote, empty, 0).has_value());
-        CHECK(!decodeBody(MessageType::AppendEntries, empty, 0).has_value());
+        constexpr std::size_t kMessageTypeCount = std::variant_size_v<Message>;
+        CHECK_EQ(kMessageTypeCount, std::size_t{8});
+
+        // Each alternative encodes to a distinct type tag, and each of
+        // those tags decodes back to the same alternative.
+        const std::vector<Message> oneOfEach = {
+            Message{Hello{1, kVersion, "a"}},
+            Message{Heartbeat{1, 1}},
+            Message{CommandForward{1, 1, Command{support::cancel(1)}}},
+            Message{EventAck{1, 1, 1}},
+            Message{AppendEntries{1, 1, 0, 0, {}}},
+            Message{AppendResponse{1, 1, true, 1, 1}},
+            Message{RequestVote{1, 1, 1}},
+            Message{VoteResponse{1, 1, true}},
+        };
+        CHECK_EQ(oneOfEach.size(), kMessageTypeCount);
+        for (const Message& m : oneOfEach) {
+            const Buffer frame = encode(m);
+            auto decoded =
+                decodeBody(typeOf(m), frame.data() + kHeaderSize, frame.size() - kHeaderSize);
+            CHECK(decoded.has_value());
+            if (decoded.has_value()) {
+                CHECK_EQ(decoded->index(), m.index());
+                CHECK(decoded.value() == m);
+            }
+        }
     }
 }
 
