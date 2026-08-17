@@ -53,6 +53,25 @@ void Replicator::log(const std::string& msg) const {
     }
 }
 
+void Replicator::setRole(Role role) {
+    if (role == role_) {
+        return;
+    }
+    role_ = role;
+    ++stats_.roleChanges;
+    // Everything this node knew about its backups was learned while
+    // someone else was leading, or in an earlier term. A new leader
+    // starts by probing each backup rather than assuming any of it still
+    // holds: the previous leader's view of who had what is exactly the
+    // information a failover invalidates.
+    for (auto& [id, state] : backups_) {
+        state.probing = true;
+        state.lastSent = 0;
+        state.lastApplied = 0;
+    }
+    log(std::string("role is now ") + toString(role_));
+}
+
 void Replicator::onPeerUp(NodeId id) {
     if (role_ != Role::Primary) {
         return;
@@ -162,6 +181,7 @@ SubmitResult Replicator::submit(const Command& cmd) {
 
 void Replicator::sendAppend(BackupState& backup, bool probe) {
     net::AppendEntries msg;
+    msg.term = term_;
     msg.leaderId = self_;
     msg.commitSeq = commitSeq();
 
@@ -219,7 +239,24 @@ void Replicator::sendAppend(BackupState& backup, bool probe) {
 }
 
 void Replicator::handleAppendEntries(NodeId from, const net::AppendEntries& msg) {
+    // A leader from a previous term has been superseded. Ignoring its
+    // entries is what stops a stale leader corrupting a follower that
+    // has already moved on. The election layer owns the term itself;
+    // the replicator only has to refuse to act on an old one.
+    if (msg.term < term_) {
+        ++stats_.staleTermRejections;
+        net::AppendResponse reject;
+        reject.term = term_;
+        reject.nodeId = self_;
+        reject.ok = false;
+        reject.lastApplied = lastApplied_;
+        reject.stateChecksum = engine_.stateChecksum();
+        transport_.send(from, Message{reject});
+        return;
+    }
+
     net::AppendResponse response;
+    response.term = term_;
     response.nodeId = self_;
 
     // A gap. The primary's entries do not follow on from what we have,
@@ -255,6 +292,14 @@ void Replicator::handleAppendEntries(NodeId from, const net::AppendEntries& msg)
 }
 
 void Replicator::handleAppendResponse(NodeId from, const net::AppendResponse& msg) {
+    // A follower in a later term means this node is a stale leader. The
+    // election layer will see the same term on its own path and step
+    // this node down; there is nothing useful to do with the response.
+    if (msg.term > term_) {
+        ++stats_.staleTermRejections;
+        return;
+    }
+
     auto it = backups_.find(from);
     if (it == backups_.end()) {
         BackupState fresh;

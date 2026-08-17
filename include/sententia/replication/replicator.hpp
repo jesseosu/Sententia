@@ -99,6 +99,8 @@ struct ReplicationStats {
     std::uint64_t probesSent{0};
     std::uint64_t checksumMismatches{0};
     std::uint64_t logTruncations{0};
+    std::uint64_t roleChanges{0};
+    std::uint64_t staleTermRejections{0};
 };
 
 // What the primary knows about one backup.
@@ -133,6 +135,17 @@ public:
 
     // Drives catch-up and retries. Call once per poll cycle.
     void tick();
+
+    // Called by the election when this node becomes or stops being
+    // leader. Taking over resets what the replicator believed about
+    // every backup, because that knowledge belonged to the previous
+    // leader and may be wrong now.
+    void setRole(Role role);
+
+    // The current election term, stamped onto outgoing AppendEntries so
+    // a follower can tell a live leader from a stale one.
+    void setTerm(std::uint64_t term) noexcept { term_ = term; }
+    std::uint64_t term() const noexcept { return term_; }
 
     Role role() const noexcept { return role_; }
     ReplicationMode mode() const noexcept { return mode_; }
@@ -175,6 +188,7 @@ private:
     Transport& transport_;
 
     Sequence lastApplied_{0};
+    std::uint64_t term_{0};
     std::size_t syncWindow_{1};
     std::map<NodeId, BackupState> backups_;
     ReplicationStats stats_;
