@@ -17,11 +17,15 @@
 #include <string>
 #include <vector>
 
+#include <chrono>
+
+#include "sententia/consensus/election.hpp"
 #include "sententia/net/cluster_config.hpp"
 #include "sententia/net/transport.hpp"
 #include "sententia/replication/replicator.hpp"
 
 using namespace sententia;
+using namespace sententia::consensus;
 using namespace sententia::net;
 using namespace sententia::replication;
 
@@ -35,7 +39,8 @@ void onSignal(int) {
 
 void usage(const char* argv0) {
     std::cerr << "usage: " << argv0 << " --id <node-id> --config <cluster.conf>\n"
-              << "  [--role primary|backup]   default backup\n"
+              << "  [--elect]                 elect a leader instead of designating one\n"
+              << "  [--role primary|backup]   ignored under --elect; default backup\n"
               << "  [--mode sync|async]       default sync\n"
               << "  [--orders <file>]         primary: replicate this order file\n"
               << "  [--sync-window N]         default 8\n"
@@ -141,6 +146,7 @@ int main(int argc, char** argv) {
     long maxCycles = -1;
     bool quiet = false;
     bool exitOnComplete = false;
+    bool elect = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -176,6 +182,8 @@ int main(int argc, char** argv) {
             heartbeatCycles = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
         } else if (arg == "--max-cycles" && i + 1 < argc) {
             maxCycles = std::strtol(argv[++i], nullptr, 10);
+        } else if (arg == "--elect") {
+            elect = true;
         } else if (arg == "--exit-on-complete") {
             exitOnComplete = true;
         } else if (arg == "--quiet") {
@@ -218,11 +226,34 @@ int main(int argc, char** argv) {
     MatchingEngine engine(kInstrument);
     CommandLog log;
     Transport transport(selfId, self->port);
-    Replicator replicator(selfId, role, mode, engine, log, transport);
+    // Under --elect nobody starts as primary. The cluster decides.
+    Replicator replicator(selfId, elect ? Role::Backup : role, mode, engine, log, transport);
     replicator.setSyncWindow(syncWindow);
 
-    const auto tag = [selfId, role] {
-        return "[" + std::string(toString(role)) + " " + std::to_string(selfId) + "] ";
+    std::vector<NodeId> peerIds;
+    for (const PeerConfig& p : config->others(selfId)) {
+        peerIds.push_back(p.id);
+    }
+    ElectionConfig electionConfig;
+    // Seeded from the node id so two nodes never share a timeout
+    // schedule, and so a run is reproducible.
+    electionConfig.randomSeed = 0x9E3779B9ULL * (selfId + 1);
+    Election election(selfId, peerIds, electionConfig);
+
+    // The clock lives here, at the edge, and is passed into the election
+    // as a parameter. The election itself never reads it, which is what
+    // lets the whole cluster be simulated on a virtual clock in tests.
+    const auto startedAt = std::chrono::steady_clock::now();
+    const auto nowMillis = [&startedAt]() -> Millis {
+        return static_cast<Millis>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - startedAt)
+                                       .count());
+    };
+
+    const auto tag = [selfId, &election, &replicator, elect] {
+        const std::string what = elect ? std::string(toString(election.role()))
+                                       : std::string(toString(replicator.role()));
+        return "[" + what + " " + std::to_string(selfId) + "] ";
     };
 
     if (!quiet) {
@@ -237,12 +268,90 @@ int main(int argc, char** argv) {
         std::cout << tag() << "PEER DOWN " << id << ": " << why << std::endl;
         replicator.onPeerDown(id);
     });
+    // Performs whatever the election asked for. The election never
+    // sends anything itself.
+    const auto runActions = [&](const ActionList& actions) {
+        for (const Action& a : actions) {
+            switch (a.kind) {
+                case Action::Kind::SendRequestVote: {
+                    RequestVote rv;
+                    rv.term = a.term;
+                    rv.candidateId = selfId;
+                    rv.lastLogSeq = a.lastLogSeq;
+                    transport.send(a.to, Message{rv});
+                    break;
+                }
+                case Action::Kind::SendVoteResponse: {
+                    VoteResponse vr;
+                    vr.term = a.term;
+                    vr.voterId = selfId;
+                    vr.granted = a.voteGranted;
+                    transport.send(a.to, Message{vr});
+                    break;
+                }
+                case Action::Kind::SendHeartbeat: {
+                    // An empty AppendEntries is the heartbeat, exactly as
+                    // in Raft. Unifying them means there is no separate
+                    // liveness path that could disagree with the
+                    // replication path about who leads.
+                    AppendEntries ae;
+                    ae.term = a.term;
+                    ae.leaderId = selfId;
+                    ae.prevSeq = log.lastSeq();
+                    ae.commitSeq = replicator.commitSeq();
+                    transport.send(a.to, Message{ae});
+                    break;
+                }
+                case Action::Kind::BecameLeader:
+                    std::cout << tag() << "ELECTED LEADER for term " << a.term << std::endl;
+                    replicator.setTerm(a.term);
+                    replicator.setRole(Role::Primary);
+                    for (const NodeId p : peerIds) {
+                        if (transport.isReady(p)) {
+                            replicator.onPeerUp(p);
+                        }
+                    }
+                    break;
+                case Action::Kind::SteppedDown:
+                    std::cout << tag() << "STEPPED DOWN at term " << a.term << std::endl;
+                    replicator.setTerm(a.term);
+                    replicator.setRole(Role::Backup);
+                    break;
+            }
+        }
+    };
+
     transport.onMessage([&](NodeId from, const Message& m) {
         // Replication traffic goes to the replicator; anything else is
         // logged. Heartbeats fall in the second group, which is what
         // keeps the Phase 2 two-node demo meaningful now that this
         // binary also does replication.
         const MessageType type = typeOf(m);
+        ActionList actions;
+        if (elect) {
+            // Election first: it owns the term, and the replicator must
+            // see the updated term before acting on the same message.
+            if (const auto* rv = std::get_if<RequestVote>(&m)) {
+                election.setLastLogSeq(log.lastSeq());
+                election.onRequestVote(*rv, nowMillis(), actions);
+                runActions(actions);
+                return;
+            }
+            if (const auto* vr = std::get_if<VoteResponse>(&m)) {
+                election.onVoteResponse(*vr, nowMillis(), actions);
+                runActions(actions);
+                return;
+            }
+            if (const auto* ae = std::get_if<AppendEntries>(&m)) {
+                election.onAppendEntries(ae->term, ae->leaderId, nowMillis(), actions);
+                runActions(actions);
+                replicator.setTerm(election.currentTerm());
+            } else if (const auto* ar = std::get_if<AppendResponse>(&m)) {
+                election.onAppendResponse(ar->term, nowMillis(), actions);
+                runActions(actions);
+                replicator.setTerm(election.currentTerm());
+            }
+        }
         if (type == MessageType::AppendEntries || type == MessageType::AppendResponse) {
             replicator.onMessage(from, m);
             return;
@@ -270,12 +379,19 @@ int main(int argc, char** argv) {
 
     while (g_stop == 0 && !complete && (maxCycles < 0 || cycles < maxCycles)) {
         transport.poll(10);
+        if (elect) {
+            ActionList actions;
+            election.setLastLogSeq(log.lastSeq());
+            election.tick(nowMillis(), actions);
+            runActions(actions);
+            replicator.setTerm(election.currentTerm());
+        }
         replicator.tick();
         ++cycles;
 
         // Feed the order file through as the primary. Busy is normal
         // backpressure, so the order is simply retried next cycle.
-        if (role == Role::Primary && nextOrder < orders.size()) {
+        if (replicator.role() == Role::Primary && nextOrder < orders.size()) {
             for (int burst = 0; burst < 256 && nextOrder < orders.size(); ++burst) {
                 const SubmitResult r = replicator.submit(orders[nextOrder]);
                 if (!r.ok()) {
@@ -308,7 +424,7 @@ int main(int argc, char** argv) {
             everConnected = true;
         }
         if (exitOnComplete) {
-            if (role == Role::Primary) {
+            if (replicator.role() == Role::Primary) {
                 // Everything submitted, applied locally, and confirmed
                 // held by every backup.
                 complete = everConnected && nextOrder == orders.size() &&
@@ -324,7 +440,13 @@ int main(int argc, char** argv) {
     const ReplicationStats& rs = replicator.stats();
     const TransportStats& ts = transport.stats();
     std::cout << tag() << "shutting down\n"
-              << "  role=" << toString(role) << " mode=" << toString(mode) << "\n"
+              << "  role=" << toString(replicator.role()) << " mode=" << toString(mode) << "\n"
+              << "  election_role=" << toString(election.role()) << "\n"
+              << "  term=" << election.currentTerm() << "\n"
+              << "  elections_started=" << election.stats().electionsStarted << "\n"
+              << "  elections_won=" << election.stats().electionsWon << "\n"
+              << "  votes_granted=" << election.stats().votesGranted << "\n"
+              << "  step_downs=" << election.stats().stepDowns << "\n"
               << "  last_applied=" << replicator.lastApplied() << "\n"
               << "  commit_seq=" << replicator.commitSeq() << "\n"
               << "  log_last_seq=" << log.lastSeq() << "\n"
