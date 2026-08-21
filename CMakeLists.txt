@@ -49,7 +49,8 @@ if(UNIX)
         src/net/cluster_config.cpp
         src/net/transport.cpp
         src/replication/command_log.cpp
-        src/replication/replicator.cpp)
+        src/replication/replicator.cpp
+        src/consensus/election.cpp)
     target_include_directories(sententia_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(sententia_net PUBLIC sententia_core PRIVATE sententia_flags)
 
@@ -92,7 +93,9 @@ set(SENTENTIA_NET_TESTS
     test_backpressure
     test_command_log
     test_replication
-    test_replication_chaos)
+    test_replication_chaos
+    test_election
+    test_election_sim)
 
 foreach(test_name IN LISTS SENTENTIA_TESTS)
     add_executable(${test_name} tests/${test_name}.cpp)
@@ -114,6 +117,13 @@ if(UNIX)
              COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/two_node_demo.sh
                      $<TARGET_FILE:node>)
     set_tests_properties(two_node_demo PROPERTIES TIMEOUT 60)
+
+    # Three real processes elect a leader, the leader is killed, and the
+    # survivors elect a replacement.
+    add_test(NAME election_demo
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/scripts/election_demo.sh
+                     $<TARGET_FILE:node>)
+    set_tests_properties(election_demo PROPERTIES TIMEOUT 120)
 
     # A primary replicates an order file to a backup and both end at the
     # same state checksum, in each acknowledgement mode.

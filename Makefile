@@ -5,7 +5,7 @@ BUILD_DIR ?= build
 BUILD_TYPE ?= Release
 JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 
-.PHONY: all build configure test bench replbench replay cluster clean format format-check help
+.PHONY: all build configure test bench replbench replay cluster election clean format format-check help
 
 all: build
 
@@ -30,6 +30,9 @@ replbench: build
 cluster: build
 	./scripts/cluster_up.sh scripts/cluster.conf $(BUILD_DIR)
 
+election: build
+	./scripts/election_demo.sh ./$(BUILD_DIR)/node
+
 format:
 	@find include src tests apps bench -name '*.hpp' -o -name '*.cpp' | xargs clang-format -i
 
@@ -46,6 +49,7 @@ help:
 	@echo "make replay        run the sample order file through the replay driver"
 	@echo "make replbench     sync vs async replication benchmark"
 	@echo "make cluster       launch a local 3-node cluster"
+	@echo "make election      elect a leader, kill it, watch failover"
 	@echo "make format        apply clang-format in place"
 	@echo "make format-check  fail if anything is unformatted"
 	@echo "make clean         remove the build directory"
