@@ -10,6 +10,8 @@ is the point of the capture step in the roadmap.
 | [`determinism-and-replication.md`](determinism-and-replication.md) | 1 | `systems/` |
 | [`tcp-framing-and-partial-io.md`](tcp-framing-and-partial-io.md) | 2 | `systems/` |
 | [`state-machine-replication.md`](state-machine-replication.md) | 3 | `systems/` |
+| [`raft-leader-election.md`](raft-leader-election.md) | 4 | `systems/` |
+| [`phase-4-field-notes.md`](phase-4-field-notes.md) | 4 | `project-retrospectives/` |
 
 The relative links inside each entry are written for its destination
 path in the Compendium repo, not for this one, so they will not resolve

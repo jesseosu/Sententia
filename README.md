@@ -7,17 +7,18 @@ deterministic recovery from node failure, extending the single-process
 [Celeritas](https://github.com/jesseosu/celeritas) engine into a
 clustered, crash-resilient system.
 
-**Status: Phase 3 complete.** A primary replicates its order book to a
-backup by shipping commands, not state, and the backup converges to a
-byte-identical book even after arbitrary link failure. Leader election is
-Phase 4.
+**Status: Phase 4 complete.** The cluster elects its own leader, detects
+when the leader dies, and elects a replacement, with no split-brain
+across 115 randomised fault schedules. Durable recovery is Phase 5.
 
 ---
 
 ## What exists today
 
 **A deterministic matching engine** (Phase 1), **a framed TCP transport**
-(Phase 2), and **state-machine replication** on top of both (Phase 3).
+(Phase 2), **state-machine replication** on top of both (Phase 3), and
+**Raft-style leader election** deciding who does the replicating
+(Phase 4).
 
 The end-to-end proof that it works is a single number. Replaying the same
 order file through the single-process driver, through a synchronous
@@ -128,6 +129,68 @@ crash exposure.
 [`docs/replication.md`](docs/replication.md) covers the model, sequencing,
 catch-up, backpressure, and divergence detection.
 
+### Leader election
+
+Through Phase 3 the primary was designated by hand. Now the cluster picks
+one itself, notices when it dies, and replaces it.
+
+```
+      +-------------+   no heartbeat       +-------------+
+      |  FOLLOWER   | -------------------> |  CANDIDATE  |
+      +-------------+   for a while        +-------------+
+             ^                                | |      |
+             |  sees a higher term,           | |      | majority
+             |  or a leader of its own term   | |      v
+             |                                | |  +----------+
+             +--------------------------------+ +->|  LEADER  |
+                                                   +----------+
+```
+
+The no-split-brain argument is one sentence: **two majorities of the same
+cluster must overlap in at least one node, and that node votes at most
+once per term**, so two candidates cannot both win a term. Not a
+heuristic, arithmetic.
+
+**The invariant is per-term, not per-instant.** A leader cut off by a
+partition keeps calling itself leader until it hears otherwise, so there
+really are two leaders for a while. That is fine: they are in different
+terms and the isolated one cannot reach a quorum, so it can commit
+nothing. Getting that distinction right is most of understanding why the
+protocol works.
+
+The election is a **pure state machine**: no socket, no clock, no thread.
+Time arrives as a parameter and actions come back as a list for the
+caller to perform. That is what makes split-brain testable rather than
+hoped for, because the whole cluster runs in one process on a virtual
+clock over a bus that can partition and crash on command:
+
+| | |
+|---|---|
+| Randomised fault schedules | 115 |
+| Cluster sizes | 3, 5, 7 |
+| Message loss | up to 20 percent |
+| Fault injections | roughly 6,900 |
+| Terms with two leaders | **0** |
+
+And the test was checked against deliberately broken implementations.
+Setting the majority to 1, or removing the one-vote-per-term rule, both
+report split-brain immediately with named reproducible seeds.
+
+[`docs/consensus.md`](docs/consensus.md) covers terms, quorums, why
+randomised timeouts are load-bearing, and the election restriction.
+
+```bash
+./scripts/election_demo.sh ./build/node
+```
+```
+node 3 elected leader for term 1
+killed node 3
+election demo OK
+  first leader:  node 3, term 1
+  after failure: node 2, term 2
+  no term ever had two leaders
+```
+
 ```bash
 ./scripts/replication_demo.sh ./build/node \
     scripts/sample_orders.txt sync
@@ -150,6 +213,7 @@ make test      # run the full ctest suite
 make bench     # single-node baseline benchmark
 make replay    # run the sample order file through the replay driver
 make cluster   # launch a local 3-node cluster
+make election  # 3 nodes elect a leader, then the leader is killed
 make replbench # synchronous vs asynchronous replication benchmark
 ```
 
@@ -235,7 +299,7 @@ order, are in [`docs/domain-model.md`](docs/domain-model.md).
 
 ```
 $ ctest --test-dir build --output-on-failure
-100% tests passed, 0 tests failed out of 22
+100% tests passed, 0 tests failed out of 25
 ```
 
 | Test | Validates |
@@ -261,6 +325,9 @@ $ ctest --test-dir build --output-on-failure
 | `test_replication` | Sync and async convergence, commit semantics, gap detection, **message amplification**, full catch-up from zero, compaction |
 | `test_replication_chaos` | Convergence under repeated link failure, 4 seeds x 4 drop rates |
 | `replication_demo_sync` / `_async` | Two real processes reaching identical checksums |
+| `test_election` | States, terms, quorums, one vote per term, the election restriction, randomised timeouts |
+| `test_election_sim` | **No split-brain** across 115 randomised partition and crash schedules on 3, 5 and 7 nodes |
+| `election_demo` | Three real processes, leader killed, replacement elected in a higher term |
 
 `test_invariants` alone makes about 224,000 assertions.
 
@@ -301,13 +368,16 @@ and that shows up directly in the measurement.
 include/sententia/       engine headers: types, command, event, order_book, engine
 include/sententia/net/   transport headers: wire, message, framing, socket, transport
 include/sententia/replication/  command log and replicator
+include/sententia/consensus/    leader election state machine
 src/                     the pure core. no I/O, no clock, no threads, no RNG
 src/net/                 the transport. POSIX sockets and poll()
 src/replication/         state-machine replication
+src/consensus/           leader election. no socket, no clock, no thread
 apps/replay/             command-file replay driver (the I/O edge)
 apps/node/               cluster node binary: engine + log + transport + replicator
 bench/                   single-node baseline benchmark (the timing edge)
-tests/                   one executable per test, plus a ~60-line harness
+tests/                   one executable per test, a ~60-line harness, and a
+                         deterministic cluster simulator (sim.hpp)
 scripts/                 sample orders, cluster configs, demo and determinism checks
 docs/                    domain model, determinism contract, wire protocol, phase reports
 ```
@@ -329,12 +399,16 @@ clock, RNG, socket, or file handle belongs on the outside of that line.
 - [`docs/replication.md`](docs/replication.md) - shipping commands rather
   than state, sequencing, the acknowledgement tradeoff with numbers,
   backpressure, catch-up, and divergence detection.
+- [`docs/consensus.md`](docs/consensus.md) - terms, quorums, why
+  randomised timeouts are load-bearing, the election restriction, and the
+  per-term invariant.
 - [`docs/failure-modes.md`](docs/failure-modes.md) - a running catalogue
   of every bug and near-miss, with symptom, cause, fix, and what catches
   it now. Worth reading before the phase reports.
 - [`docs/phase-1-report.md`](docs/phase-1-report.md),
   [`docs/phase-2-report.md`](docs/phase-2-report.md) and
-  [`docs/phase-3-report.md`](docs/phase-3-report.md) - each phase checked
+  [`docs/phase-3-report.md`](docs/phase-3-report.md) and
+  [`docs/phase-4-report.md`](docs/phase-4-report.md) - each phase checked
   against its definition of done, with the gaps carried forward.
 
 ## Roadmap
@@ -345,8 +419,8 @@ clock, RNG, socket, or file handle belongs on the outside of that line.
 | 1 | Single-node baseline: pure deterministic core, tests | **Done** |
 | 2 | Networking layer: TCP message passing between nodes | **Done** |
 | 3 | State replication, primary to backup | **Done** |
-| 4 | Leader election | Next |
-| 5 | Fault-tolerant recovery | |
+| 4 | Leader election | **Done** |
+| 5 | Fault-tolerant recovery | Next |
 | 6 | Benchmarking and hardening | |
 | 7 | Documentation and writeup | |
 

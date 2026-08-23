@@ -246,6 +246,72 @@ about one round in eight.
 
 ---
 
+## 8. An invariant that was stronger than the guarantee
+
+**Phase 4. Symptom:** the minority-partition test failed. A node on the
+two-node side of a five-node partition was a leader.
+
+**Cause:** the test, not the protocol. If the leader elected before the
+partition lands in the minority, it stays leader in its **old term**,
+because nothing has told it otherwise. The majority elects a replacement
+in a higher term. Two nodes then call themselves leader.
+
+That is not split-brain. They are in different terms, and the isolated
+one cannot reach a majority so it cannot commit anything.
+
+**Why it mattered:** the assertion "at most one leader at any instant" is
+stronger than what Raft guarantees, and it fails on correct behaviour.
+The real invariant is "no term ever has two leaders". The gap between
+those two statements is most of the correctness argument.
+
+**Fix:** build the partition so the existing leader is on the majority
+side, then assert the sharp property: no node in the minority ever
+reaches leader, and `electionsWon` stays zero for all of them.
+
+**Caught now by:** `testMinorityPartitionCannotElectALeader`, plus the
+continuous `assertNoSplitBrain` check that uses the correct per-term
+invariant.
+
+---
+
+## 9. A decoder that silently dropped every reply
+
+**Phase 4. Symptom:** every replication test failed at once after adding
+terms to the replication messages. The backup had applied 0 commands
+while the primary had applied 3,000.
+
+**Cause:** a `term` field was added to `AppendResponse`. The encoder
+wrote it; the decoder did not read it. The edit that should have updated
+the decoder was a text substitution that no longer matched, because
+`clang-format` had rewrapped the line. It reported success and changed
+nothing.
+
+Every `AppendResponse` then decoded misaligned, failed its
+trailing-bytes check, and was discarded as undecodable. Replication
+stopped dead, with the only evidence a log line nobody was reading.
+
+**The deeper cause:** `AppendEntries` and `AppendResponse` were added in
+Phase 3 with no round-trip codec coverage. Every other message type had
+it.
+
+**Fix:** read the field. More usefully, round-trip coverage for every
+message type plus a guard that fails if a new one is added without it:
+
+```cpp
+constexpr std::size_t kMessageTypeCount = std::variant_size_v<Message>;
+CHECK_EQ(kMessageTypeCount, std::size_t{8});
+```
+
+**Caught now by:** `test_message_codec`, which now round-trips all eight
+message types and refuses to be quietly incomplete.
+
+**The general lesson:** a serialisation format has two halves that must
+agree and nothing in the type system makes them. A round-trip test is the
+only thing standing between you and a field that is written and never
+read.
+
+---
+
 ## Open, deliberately
 
 Things known to be wrong or missing, listed so they read as decisions.
