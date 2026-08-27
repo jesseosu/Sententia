@@ -204,6 +204,57 @@ void MatchingEngine::applyCancel(const CancelOrder& cmd, EventList& out) {
     emitTopOfBookIfChanged(out);
 }
 
+EngineSnapshot MatchingEngine::snapshot() const {
+    EngineSnapshot snap;
+    snap.instrument = instrument_;
+    snap.commandSeq = commandSeq_;
+    snap.eventSeq = eventSeq_;
+    snap.arrivalCounter = arrivalCounter_;
+    snap.lastTop = lastTop_;
+    snap.orders.reserve(book_.orderCount());
+    // Canonical order, the same walk the checksum uses: bids descending,
+    // asks ascending, FIFO within each level.
+    for (const auto& [price, queue] : book_.bids()) {
+        (void)price;
+        for (const RestingOrder& o : queue) {
+            snap.orders.push_back(o);
+        }
+    }
+    for (const auto& [price, queue] : book_.asks()) {
+        (void)price;
+        for (const RestingOrder& o : queue) {
+            snap.orders.push_back(o);
+        }
+    }
+    return snap;
+}
+
+bool MatchingEngine::restore(const EngineSnapshot& snap) {
+    if (snap.instrument != instrument_) {
+        return false;
+    }
+    for (const RestingOrder& o : snap.orders) {
+        if (o.quantity == 0 || o.price <= 0) {
+            return false;
+        }
+    }
+
+    book_ = OrderBook{};
+    // Resting in the snapshot's order reproduces each level's FIFO
+    // queue, because rest() appends and the snapshot walked FIFO.
+    for (const RestingOrder& o : snap.orders) {
+        if (book_.contains(o.id)) {
+            return false;
+        }
+        book_.rest(o);
+    }
+    commandSeq_ = snap.commandSeq;
+    eventSeq_ = snap.eventSeq;
+    arrivalCounter_ = snap.arrivalCounter;
+    lastTop_ = snap.lastTop;
+    return true;
+}
+
 std::uint64_t MatchingEngine::stateChecksum() const noexcept {
     std::uint64_t h = book_.checksum();
     mix(h, commandSeq_);

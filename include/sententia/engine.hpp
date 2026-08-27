@@ -28,6 +28,28 @@
 
 namespace sententia {
 
+// A complete, restorable picture of an engine's state.
+//
+// Everything needed to reconstruct an engine so that stateChecksum()
+// matches, including the counters. Leaving out arrivalCounter_ would
+// restore a book that looks right and breaks time priority for every
+// order placed afterwards, which is the kind of bug that would surface
+// weeks later as unfair fills.
+//
+// Orders are in canonical order: bids by descending price, asks by
+// ascending, FIFO within a level. Restoring in that order reproduces the
+// queues exactly.
+struct EngineSnapshot {
+    InstrumentId instrument{};
+    Sequence commandSeq{};
+    Sequence eventSeq{};
+    Sequence arrivalCounter{};
+    TopOfBook lastTop{};
+    std::vector<RestingOrder> orders;
+
+    friend bool operator==(const EngineSnapshot&, const EngineSnapshot&) = default;
+};
+
 class MatchingEngine {
 public:
     explicit MatchingEngine(InstrumentId instrument) noexcept;
@@ -51,6 +73,15 @@ public:
     // Combines the book checksum with the engine's counters. Two engines
     // that agree on this have identical observable state.
     std::uint64_t stateChecksum() const noexcept;
+
+    // Captures everything needed to rebuild this engine elsewhere. Pure:
+    // no I/O, no clock. Serialising it is the storage layer's job.
+    EngineSnapshot snapshot() const;
+
+    // Replaces this engine's state wholesale. Returns false if the
+    // snapshot is for a different instrument or is internally
+    // inconsistent, rather than half-applying it.
+    bool restore(const EngineSnapshot& snap);
 
 private:
     void applyNewOrder(const NewOrder& cmd, EventList& out);
