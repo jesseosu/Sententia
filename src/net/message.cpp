@@ -124,10 +124,12 @@ struct BodyVisitor {
         w.u64(m.term);
         w.u32(m.leaderId);
         w.u64(m.prevSeq);
+        w.u64(m.prevTerm);
         w.u64(m.commitSeq);
         w.u32(static_cast<std::uint32_t>(m.entries.size()));
         for (const LogRecord& e : m.entries) {
             w.u64(e.seq);
+            w.u64(e.term);
             encodeCommand(w, e.command);
         }
     }
@@ -135,6 +137,7 @@ struct BodyVisitor {
     void operator()(const AppendResponse& m) const {
         w.u64(m.term);
         w.u32(m.nodeId);
+        w.u64(m.lastLogSeq);
         w.u8(m.ok ? 1 : 0);
         w.u64(m.lastApplied);
         w.u64(m.stateChecksum);
@@ -217,8 +220,8 @@ std::optional<Message> decodeBody(MessageType type, const Byte* data, std::size_
         case MessageType::AppendEntries: {
             AppendEntries m;
             std::uint32_t count = 0;
-            if (!r.u64(m.term) || !r.u32(m.leaderId) || !r.u64(m.prevSeq) || !r.u64(m.commitSeq) ||
-                !r.u32(count)) {
+            if (!r.u64(m.term) || !r.u32(m.leaderId) || !r.u64(m.prevSeq) || !r.u64(m.prevTerm) ||
+                !r.u64(m.commitSeq) || !r.u32(count)) {
                 return std::nullopt;
             }
             // Untrusted count. Cap it before it becomes a reserve, for
@@ -229,7 +232,7 @@ std::optional<Message> decodeBody(MessageType type, const Byte* data, std::size_
             m.entries.reserve(count);
             for (std::uint32_t i = 0; i < count; ++i) {
                 LogRecord e;
-                if (!r.u64(e.seq) || !decodeCommand(r, e.command)) {
+                if (!r.u64(e.seq) || !r.u64(e.term) || !decodeCommand(r, e.command)) {
                     return std::nullopt;
                 }
                 m.entries.push_back(std::move(e));
@@ -242,8 +245,8 @@ std::optional<Message> decodeBody(MessageType type, const Byte* data, std::size_
         case MessageType::AppendResponse: {
             AppendResponse m;
             std::uint8_t ok = 0;
-            if (!r.u64(m.term) || !r.u32(m.nodeId) || !r.u8(ok) || !r.u64(m.lastApplied) ||
-                !r.u64(m.stateChecksum) || !r.ok() || !r.exhausted()) {
+            if (!r.u64(m.term) || !r.u32(m.nodeId) || !r.u64(m.lastLogSeq) || !r.u8(ok) ||
+                !r.u64(m.lastApplied) || !r.u64(m.stateChecksum) || !r.ok() || !r.exhausted()) {
                 return std::nullopt;
             }
             if (ok > 1) {

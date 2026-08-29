@@ -108,6 +108,7 @@ struct EventAck {
 // Phase 1, which is why forwarding it needs no reconciliation.
 struct LogRecord {
     std::uint64_t seq{};
+    std::uint64_t term{};
     Command command{};
 
     friend bool operator==(const LogRecord&, const LogRecord&) = default;
@@ -130,6 +131,12 @@ struct AppendEntries {
     std::uint64_t term{};
     NodeId leaderId{};
     std::uint64_t prevSeq{};
+    // The term of the entry at prevSeq. Log matching: a follower accepts
+    // these entries only if it holds an entry at prevSeq with exactly
+    // this term. Matching on the sequence number alone is not enough
+    // once leaders can change, because two leaders can each have written
+    // a different entry at the same sequence.
+    std::uint64_t prevTerm{};
     std::uint64_t commitSeq{};
     std::vector<LogRecord> entries;
 
@@ -142,6 +149,14 @@ struct AppendEntries {
 struct AppendResponse {
     std::uint64_t term{};
     NodeId nodeId{};
+    // The follower's LOG head, which is what the leader counts towards a
+    // majority. Deliberately NOT the applied index: a follower applies
+    // only what the leader has told it is committed, and the leader
+    // cannot know an entry is committed until followers report holding
+    // it. Using the applied index here makes the two wait on each other
+    // and nothing is ever committed. That deadlock is easy to write and
+    // its symptom is simply that everything hangs.
+    std::uint64_t lastLogSeq{};
     bool ok{false};
     std::uint64_t lastApplied{};
     std::uint64_t stateChecksum{};

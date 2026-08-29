@@ -49,15 +49,16 @@ void run() {
     // and the decoder was not. The result was that every AppendResponse
     // silently failed to decode and was dropped, so replication stopped
     // dead. A round-trip here would have caught it in seconds.
-    roundTrip(AppendEntries{3, 1, 10, 5, {}});
+    roundTrip(AppendEntries{3, 1, 10, 2, 5, {}});
     roundTrip(AppendEntries{7,
                             2,
                             0,
                             0,
-                            {LogRecord{1, Command{support::limit(1, Side::Buy, 100, 5)}},
-                             LogRecord{2, Command{support::cancel(1)}}}});
-    roundTrip(AppendResponse{4, 2, true, 99, 123456789});
-    roundTrip(AppendResponse{0, 5, false, 0, 0});
+                            0,
+                            {LogRecord{1, 7, Command{support::limit(1, Side::Buy, 100, 5)}},
+                             LogRecord{2, 7, Command{support::cancel(1)}}}});
+    roundTrip(AppendResponse{4, 2, 99, true, 99, 123456789});
+    roundTrip(AppendResponse{0, 5, 0, false, 0, 0});
     roundTrip(RequestVote{9, 3, 4242});
     roundTrip(RequestVote{0, 1, 0});
     roundTrip(VoteResponse{9, 2, true});
@@ -160,8 +161,8 @@ void run() {
             Message{Heartbeat{1, 1}},
             Message{CommandForward{1, 1, Command{support::cancel(1)}}},
             Message{EventAck{1, 1, 1}},
-            Message{AppendEntries{1, 1, 0, 0, {}}},
-            Message{AppendResponse{1, 1, true, 1, 1}},
+            Message{AppendEntries{1, 1, 0, 0, 0, {}}},
+            Message{AppendResponse{1, 1, 1, true, 1, 1}},
             Message{RequestVote{1, 1, 1}},
             Message{VoteResponse{1, 1, true}},
         };

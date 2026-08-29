@@ -46,11 +46,11 @@ void run() {
     // tolerate, so it is refused rather than repaired.
     {
         CommandLog backup;
-        CHECK(backup.appendAt(1, support::limit(1, Side::Buy, 100, 10)));
-        CHECK(!backup.appendAt(3, support::limit(3, Side::Buy, 100, 10)));  // gap
-        CHECK(!backup.appendAt(1, support::limit(9, Side::Buy, 100, 10)));  // replay
+        CHECK(backup.appendAt(1, 1, support::limit(1, Side::Buy, 100, 10)));
+        CHECK(!backup.appendAt(3, 1, support::limit(3, Side::Buy, 100, 10)));  // gap
+        CHECK(!backup.appendAt(1, 1, support::limit(9, Side::Buy, 100, 10)));  // replay
         CHECK_EQ(backup.lastSeq(), Sequence{1});
-        CHECK(backup.appendAt(2, support::limit(2, Side::Buy, 100, 10)));
+        CHECK(backup.appendAt(2, 1, support::limit(2, Side::Buy, 100, 10)));
         CHECK_EQ(backup.lastSeq(), Sequence{2});
     }
 

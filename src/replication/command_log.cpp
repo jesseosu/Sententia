@@ -2,20 +2,58 @@
 
 namespace sententia::replication {
 
-Sequence CommandLog::append(const Command& cmd) {
+Sequence CommandLog::append(const Command& cmd, std::uint64_t term) {
     const Sequence seq = lastSeq_ + 1;
-    entries_.push_back(LogEntry{seq, cmd});
+    entries_.push_back(LogEntry{seq, term, cmd});
     lastSeq_ = seq;
     return seq;
 }
 
-bool CommandLog::appendAt(Sequence seq, const Command& cmd) {
+bool CommandLog::appendAt(Sequence seq, std::uint64_t term, const Command& cmd) {
     if (seq != lastSeq_ + 1) {
         return false;
     }
-    entries_.push_back(LogEntry{seq, cmd});
+    entries_.push_back(LogEntry{seq, term, cmd});
     lastSeq_ = seq;
     return true;
+}
+
+std::optional<std::uint64_t> CommandLog::termAt(Sequence seq) const noexcept {
+    // Sequence 0 is the empty log, by convention term 0.
+    if (seq == 0) {
+        return std::uint64_t{0};
+    }
+    // The entry immediately before the retained window lives in the
+    // snapshot, and its term was recorded there. Without this, log
+    // matching would fail forever after a compaction.
+    if (seq == snapshotSeq_ && snapshotSeq_ != 0) {
+        return snapshotTerm_;
+    }
+    const LogEntry* entry = at(seq);
+    if (entry == nullptr) {
+        return std::nullopt;
+    }
+    return entry->term;
+}
+
+void CommandLog::truncateFrom(Sequence seq) {
+    while (!entries_.empty() && entries_.back().seq >= seq) {
+        entries_.pop_back();
+    }
+    lastSeq_ = entries_.empty()
+                   ? (snapshotSeq_ > truncatedThrough_ ? snapshotSeq_ : truncatedThrough_)
+                   : entries_.back().seq;
+}
+
+void CommandLog::setSnapshotBoundary(Sequence seq, std::uint64_t term) noexcept {
+    snapshotSeq_ = seq;
+    snapshotTerm_ = term;
+    if (lastSeq_ < seq) {
+        lastSeq_ = seq;
+    }
+    if (truncatedThrough_ < seq) {
+        truncatedThrough_ = seq;
+    }
 }
 
 const LogEntry* CommandLog::at(Sequence seq) const noexcept {

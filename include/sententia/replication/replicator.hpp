@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -101,11 +102,30 @@ struct ReplicationStats {
     std::uint64_t logTruncations{0};
     std::uint64_t roleChanges{0};
     std::uint64_t staleTermRejections{0};
+    std::uint64_t logMatchRejections{0};
+    std::uint64_t conflictingEntriesTruncated{0};
+    std::uint64_t snapshotsInstalled{0};
+    std::uint64_t snapshotsTaken{0};
+    std::uint64_t recoveredFromLog{0};
+    std::uint64_t commitAdvances{0};
 };
 
 // What the primary knows about one backup.
 struct BackupState {
     NodeId id{};
+    // Raft's matchIndex: the highest entry known to be replicated here.
+    // The commit point is derived from a MAJORITY of these, not from all
+    // of them, which is what lets the cluster make progress with a slow
+    // or dead minority.
+    Sequence matchSeq{0};
+    // The commit point this backup has already been told about. Without
+    // tracking it, the last entry of a burst never becomes applied on
+    // the follower: the leader commits it only after hearing the
+    // follower holds it, and by then it has nothing left to send, so the
+    // new commit point is never advertised. The follower sits one entry
+    // behind forever. Raft avoids this with periodic heartbeats; this
+    // sends an empty append whenever the commit point moves.
+    Sequence lastCommitSent{0};
     // Highest sequence this backup reports having applied.
     Sequence lastApplied{0};
     // Highest sequence sent to it, so a catch-up is not re-sent every
@@ -171,10 +191,25 @@ public:
     // log grows for the life of the process.
     void compactLog();
 
+    // Number of nodes in the cluster, including this one. Needed because
+    // the commit point is a majority, and a majority of what has to be
+    // known. Defaults to 2 (one leader, one backup), which is what
+    // Phase 3 effectively assumed.
+    void setClusterSize(std::size_t n) noexcept { clusterSize_ = n < 1 ? 1 : n; }
+    std::size_t clusterSize() const noexcept { return clusterSize_; }
+    std::size_t majority() const noexcept { return clusterSize_ / 2 + 1; }
+
+    // Applies everything up to the commit point. A follower calls this
+    // when the leader tells it the commit point moved.
+    void applyCommitted();
+    Sequence commitIndex() const noexcept { return commitIndex_; }
+
     void onLog(std::function<void(const std::string&)> h) { onLog_ = std::move(h); }
 
 private:
-    void applyThrough(Sequence seq);
+    // Recomputes the commit point from a majority of matchSeq values.
+    void advanceCommitIndex();
+    void rebuildFromLog();
     void sendAppend(BackupState& backup, bool probe);
     void handleAppendEntries(NodeId from, const net::AppendEntries& msg);
     void handleAppendResponse(NodeId from, const net::AppendResponse& msg);
@@ -188,7 +223,11 @@ private:
     Transport& transport_;
 
     Sequence lastApplied_{0};
+    Sequence commitIndex_{0};
     std::uint64_t term_{0};
+    std::size_t clusterSize_{2};
+    // The snapshot this node's log continues from, if any.
+    std::optional<sententia::EngineSnapshot> snapshotBase_;
     std::size_t syncWindow_{1};
     std::map<NodeId, BackupState> backups_;
     ReplicationStats stats_;

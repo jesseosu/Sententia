@@ -1,6 +1,8 @@
 #include "sententia/replication/replicator.hpp"
 
 #include <algorithm>
+#include <functional>
+#include <vector>
 
 namespace sententia::replication {
 namespace {
@@ -68,6 +70,8 @@ void Replicator::setRole(Role role) {
         state.probing = true;
         state.lastSent = 0;
         state.lastApplied = 0;
+        state.matchSeq = 0;
+        state.lastCommitSent = 0;
     }
     log(std::string("role is now ") + toString(role_));
 }
@@ -101,34 +105,15 @@ std::vector<BackupState> Replicator::backups() const {
 }
 
 Sequence Replicator::commitSeq() const noexcept {
-    if (backups_.empty()) {
-        return 0;
-    }
-    // Committed means every backup holds it. With one backup this is
-    // just its position; the min generalises to more without changing
-    // the meaning.
-    Sequence lowest = backups_.begin()->second.lastApplied;
-    for (const auto& [id, state] : backups_) {
-        lowest = std::min(lowest, state.lastApplied);
-    }
-    return lowest;
-}
-
-void Replicator::applyThrough(Sequence seq) {
-    sententia::EventList sink;
-    while (lastApplied_ < seq) {
-        const LogEntry* entry = log_.at(lastApplied_ + 1);
-        if (entry == nullptr) {
-            // The entry is not available, so stop rather than skipping
-            // it. Applying out of order would break determinism in a way
-            // no later check could repair.
-            break;
-        }
-        sink.clear();
-        engine_.apply(entry->command, sink);
-        lastApplied_ = entry->seq;
-        ++stats_.applied;
-    }
+    // Phase 3 defined this as the MINIMUM across all backups: an entry
+    // was committed once every backup held it. Simple, and it means one
+    // slow or dead backup stalls the whole cluster, which is the
+    // opposite of fault tolerance.
+    //
+    // Phase 5 replaces it with a majority, computed in
+    // advanceCommitIndex(). The cluster now makes progress while a
+    // minority is down, which is the entire point.
+    return commitIndex_;
 }
 
 SubmitResult Replicator::submit(const Command& cmd) {
@@ -163,12 +148,18 @@ SubmitResult Replicator::submit(const Command& cmd) {
         }
     }
 
-    const Sequence seq = log_.append(cmd);
+    const Sequence seq = log_.append(cmd, term_);
     ++stats_.submitted;
 
-    if (mode_ == ReplicationMode::Asynchronous) {
-        // Apply now; the backup catches up on its own schedule.
-        applyThrough(seq);
+    // The leader no longer applies on submit. It applies when the entry
+    // is committed, which under Asynchronous is as soon as a majority
+    // has it and under Synchronous is the same rule with a tighter
+    // window. Applying before commit is what would lose data on a leader
+    // crash, because a client could observe a trade that never made it
+    // to a majority.
+    if (clusterSize_ == 1) {
+        // A single-node cluster is its own majority.
+        advanceCommitIndex();
     }
 
     for (auto& [id, state] : backups_) {
@@ -187,11 +178,23 @@ void Replicator::sendAppend(BackupState& backup, bool probe) {
 
     if (probe) {
         msg.prevSeq = log_.lastSeq();
+        msg.prevTerm = log_.termAt(log_.lastSeq()).value_or(0);
         ++stats_.probesSent;
     } else {
-        const Sequence from = std::max(backup.lastApplied, backup.lastSent) + 1;
+        const Sequence from = std::max(backup.matchSeq, backup.lastSent) + 1;
         if (from > log_.lastSeq()) {
-            return;  // backup is current, nothing to send
+            // No new entries. But if the commit point has moved since we
+            // last told this backup, it needs to know, or it will never
+            // apply the entries it already holds.
+            if (commitIndex_ > backup.lastCommitSent) {
+                msg.prevSeq = log_.lastSeq();
+                msg.prevTerm = log_.termAt(log_.lastSeq()).value_or(0);
+                const auto result = transport_.send(backup.id, Message{std::move(msg)});
+                if (result == SendResult::Ok) {
+                    backup.lastCommitSent = commitIndex_;
+                }
+            }
+            return;
         }
         if (!log_.canServeFrom(from)) {
             // The entries this backup needs have been truncated away.
@@ -206,9 +209,11 @@ void Replicator::sendAppend(BackupState& backup, bool probe) {
             return;
         }
         msg.prevSeq = from - 1;
+        const auto prevTerm = log_.termAt(from - 1);
+        msg.prevTerm = prevTerm.value_or(0);
         msg.entries.reserve(entries.size());
         for (const LogEntry& e : entries) {
-            msg.entries.push_back(net::LogRecord{e.seq, e.command});
+            msg.entries.push_back(net::LogRecord{e.seq, e.term, e.command});
         }
         if (entries.size() > 1) {
             ++stats_.catchUpBatches;
@@ -234,6 +239,7 @@ void Replicator::sendAppend(BackupState& backup, bool probe) {
     }
     if (!probe && batchSize > 0) {
         backup.lastSent = lastInBatch;
+        backup.lastCommitSent = commitIndex_;
         stats_.entriesSent += batchSize;
     }
 }
@@ -250,6 +256,7 @@ void Replicator::handleAppendEntries(NodeId from, const net::AppendEntries& msg)
         reject.nodeId = self_;
         reject.ok = false;
         reject.lastApplied = lastApplied_;
+        reject.lastLogSeq = log_.lastSeq();
         reject.stateChecksum = engine_.stateChecksum();
         transport_.send(from, Message{reject});
         return;
@@ -259,13 +266,25 @@ void Replicator::handleAppendEntries(NodeId from, const net::AppendEntries& msg)
     response.term = term_;
     response.nodeId = self_;
 
-    // A gap. The primary's entries do not follow on from what we have,
-    // so applying them would produce a different state than the primary
-    // computed. Report our real position and let the primary resend.
-    if (msg.prevSeq != lastApplied_) {
-        ++stats_.gapsDetected;
+    // LOG MATCHING.
+    //
+    // Phase 3 only checked the sequence number, which was enough while
+    // one node had ever written the log. Once leaders can change, two
+    // leaders in different terms can each have written a DIFFERENT entry
+    // at the same sequence, so a follower must check that its entry at
+    // prevSeq has the same TERM the leader expects. Matching on the
+    // number alone would splice two different histories together and
+    // produce a book that never existed on any node.
+    const auto localPrevTerm = log_.termAt(msg.prevSeq);
+    if (!localPrevTerm.has_value() || localPrevTerm.value() != msg.prevTerm) {
+        if (!localPrevTerm.has_value()) {
+            ++stats_.gapsDetected;
+        } else {
+            ++stats_.logMatchRejections;
+        }
         response.ok = false;
         response.lastApplied = lastApplied_;
+        response.lastLogSeq = log_.lastSeq();
         response.stateChecksum = engine_.stateChecksum();
         transport_.send(from, Message{response});
         return;
@@ -273,22 +292,154 @@ void Replicator::handleAppendEntries(NodeId from, const net::AppendEntries& msg)
 
     sententia::EventList sink;
     for (const net::LogRecord& record : msg.entries) {
-        if (!log_.appendAt(record.seq, record.command)) {
-            // Out of order within the batch itself. Stop and resync.
+        const auto existing = log_.termAt(record.seq);
+        if (existing.has_value() && record.seq <= log_.lastSeq()) {
+            if (existing.value() == record.term) {
+                continue;  // already have exactly this entry
+            }
+            // CONFLICT. We hold a different entry at this sequence,
+            // written by a leader that has since been superseded. Ours
+            // is wrong, so the divergent tail goes.
+            //
+            // This is only ever safe because of the commit rule: an
+            // entry that was committed is held by a majority, and the
+            // election restriction means no candidate missing it can
+            // win. So anything truncated here was never committed, and
+            // no client was ever told it succeeded.
+            if (record.seq <= commitIndex_) {
+                // Truncating a committed entry would mean the safety
+                // argument had failed somewhere. Refuse rather than
+                // corrupt, and make it loud.
+                log("REFUSING to truncate committed entry at seq " + std::to_string(record.seq) +
+                    "; this should be impossible");
+                response.ok = false;
+                response.lastApplied = lastApplied_;
+                response.stateChecksum = engine_.stateChecksum();
+                transport_.send(from, Message{response});
+                return;
+            }
+            log_.truncateFrom(record.seq);
+            ++stats_.conflictingEntriesTruncated;
+            // The engine has already applied the entries being thrown
+            // away, so it has to be rebuilt from the surviving prefix.
+            rebuildFromLog();
+        }
+        if (!log_.appendAt(record.seq, record.term, record.command)) {
             ++stats_.gapsDetected;
             break;
         }
-        sink.clear();
-        engine_.apply(record.command, sink);
-        lastApplied_ = record.seq;
-        ++stats_.applied;
         ++stats_.entriesReceived;
     }
 
+    // A follower applies only up to the leader's commit point, never to
+    // the end of its own log. Entries past the commit point may still be
+    // truncated, and applying them early would let a client observe a
+    // trade that later un-happens.
+    if (msg.commitSeq > commitIndex_) {
+        commitIndex_ = std::min(msg.commitSeq, log_.lastSeq());
+        ++stats_.commitAdvances;
+    }
+    applyCommitted();
+
     response.ok = true;
     response.lastApplied = lastApplied_;
+    response.lastLogSeq = log_.lastSeq();
     response.stateChecksum = engine_.stateChecksum();
     transport_.send(from, Message{response});
+}
+
+void Replicator::applyCommitted() {
+    sententia::EventList sink;
+    while (lastApplied_ < commitIndex_) {
+        const LogEntry* entry = log_.at(lastApplied_ + 1);
+        if (entry == nullptr) {
+            break;
+        }
+        sink.clear();
+        engine_.apply(entry->command, sink);
+        lastApplied_ = entry->seq;
+        ++stats_.applied;
+    }
+}
+
+void Replicator::rebuildFromLog() {
+    // Replay the retained log from the snapshot boundary. Deterministic,
+    // so this reproduces exactly the state the surviving prefix implies.
+    sententia::EngineSnapshot base = engine_.snapshot();
+    (void)base;
+    engine_ = sententia::MatchingEngine(engine_.instrument());
+    if (snapshotBase_.has_value()) {
+        engine_.restore(snapshotBase_.value());
+    }
+    lastApplied_ = log_.snapshotSeq();
+    sententia::EventList sink;
+    for (Sequence seq = log_.snapshotSeq() + 1; seq <= log_.lastSeq(); ++seq) {
+        const LogEntry* entry = log_.at(seq);
+        if (entry == nullptr) {
+            break;
+        }
+        sink.clear();
+        engine_.apply(entry->command, sink);
+        lastApplied_ = seq;
+    }
+    if (commitIndex_ > lastApplied_) {
+        commitIndex_ = lastApplied_;
+    }
+}
+
+void Replicator::advanceCommitIndex() {
+    if (role_ != Role::Primary) {
+        return;
+    }
+    // MAJORITY COMMIT.
+    //
+    // Collect every node's match point, including the leader's own log
+    // head, sort descending, and take the value at index majority-1.
+    // That is the highest sequence a majority holds.
+    //
+    // Phase 3 used the MINIMUM across all backups, which is stricter and
+    // simpler but means one slow or dead backup stalls the cluster. A
+    // majority keeps making progress while a minority is down, which is
+    // the entire point of tolerating failure.
+    std::vector<Sequence> matches;
+    matches.reserve(backups_.size() + 1);
+    matches.push_back(log_.lastSeq());
+    for (const auto& [id, state] : backups_) {
+        matches.push_back(state.matchSeq);
+    }
+    // A cluster larger than the peers we can currently see still needs a
+    // majority of the CONFIGURED size, or a partitioned minority could
+    // commit on its own.
+    while (matches.size() < clusterSize_) {
+        matches.push_back(0);
+    }
+    std::sort(matches.begin(), matches.end(), std::greater<Sequence>());
+    const Sequence candidate = matches[majority() - 1];
+
+    if (candidate <= commitIndex_) {
+        return;
+    }
+
+    // THE FIGURE 8 RULE, and it is the subtlest thing in the project.
+    //
+    // A leader may NOT commit an entry from a previous term just because
+    // a majority now holds it. Raft's paper has a five-node scenario
+    // where doing so lets a committed entry be overwritten later.
+    //
+    // The reason: a majority holding an old entry does not mean that
+    // entry is safe, because a future leader could still be elected
+    // without it. Only once the current leader has committed an entry
+    // from its OWN term does the election restriction guarantee every
+    // future leader carries everything up to that point. Committing an
+    // entry from the current term carries the earlier ones with it.
+    const auto candidateTerm = log_.termAt(candidate);
+    if (!candidateTerm.has_value() || candidateTerm.value() != term_) {
+        return;
+    }
+
+    commitIndex_ = candidate;
+    ++stats_.commitAdvances;
+    applyCommitted();
 }
 
 void Replicator::handleAppendResponse(NodeId from, const net::AppendResponse& msg) {
@@ -309,6 +460,11 @@ void Replicator::handleAppendResponse(NodeId from, const net::AppendResponse& ms
     BackupState& backup = it->second;
 
     backup.lastApplied = msg.lastApplied;
+    // The match point is the follower's LOG head, not what it has
+    // applied. See the comment on AppendResponse::lastLogSeq.
+    if (msg.ok) {
+        backup.matchSeq = msg.lastLogSeq;
+    }
     backup.lastChecksum = msg.stateChecksum;
     backup.probing = false;
     // Never let lastSent sit ahead of what the backup admits to holding
@@ -322,12 +478,11 @@ void Replicator::handleAppendResponse(NodeId from, const net::AppendResponse& ms
             std::to_string(msg.lastApplied + 1));
     }
 
-    if (mode_ == ReplicationMode::Synchronous) {
-        // A command is applied on the primary only once a backup holds
-        // it. This is what makes "the client was told done" mean "both
-        // nodes have it".
-        applyThrough(commitSeq());
-    }
+    // Recompute the commit point from a majority, then apply up to it.
+    // Under both modes the leader applies only committed entries now,
+    // which is what makes a leader crash safe: nothing a client saw can
+    // be lost, and nothing unlogged was ever shown.
+    advanceCommitIndex();
 
     // Divergence check. Two nodes that have applied the same sequence
     // must agree on state; this compares a single integer rather than
@@ -340,8 +495,8 @@ void Replicator::handleAppendResponse(NodeId from, const net::AppendResponse& ms
             std::to_string(engine_.stateChecksum()) + " at seq " + std::to_string(lastApplied_));
     }
 
-    // More to send.
-    if (backup.lastSent < log_.lastSeq()) {
+    // More to send, or a newly advanced commit point to advertise.
+    if (backup.lastSent < log_.lastSeq() || commitIndex_ > backup.lastCommitSent) {
         sendAppend(backup, false);
     }
 }
@@ -367,7 +522,12 @@ void Replicator::tick() {
         }
         // Retry anything the transport refused earlier, and drive
         // catch-up for a backup that is behind.
-        if (state.lastSent < log_.lastSeq() && !transport_.isSaturated(id)) {
+        if (transport_.isSaturated(id)) {
+            continue;
+        }
+        // Either there are new entries to send, or the commit point has
+        // moved and the backup has not been told.
+        if (state.lastSent < log_.lastSeq() || commitIndex_ > state.lastCommitSent) {
             sendAppend(state, false);
         }
     }

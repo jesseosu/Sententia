@@ -53,6 +53,31 @@ struct Node {
     }
 };
 
+// THE ORACLE.
+//
+// Every convergence assertion in this file used to compare the leader
+// against the follower and nothing else. That checks AGREEMENT, which is
+// not the same as CORRECTNESS: a bug that breaks both nodes identically
+// passes every one of them.
+//
+// This is not hypothetical. The mutation harness broke the apply loop so
+// that one command in five hundred was skipped, and every convergence
+// test still passed, because leader and follower skipped exactly the
+// same ones and agreed perfectly on a wrong book.
+//
+// So there is now a third party: a single-process engine applying the
+// same commands with no replication involved at all. The cluster must
+// match IT, not just itself.
+std::uint64_t referenceChecksum(const std::vector<Command>& cmds) {
+    MatchingEngine reference(kInstrument);
+    EventList sink;
+    for (const Command& c : cmds) {
+        sink.clear();
+        reference.apply(c, sink);
+    }
+    return reference.stateChecksum();
+}
+
 bool pump(Node& a, Node& b, const std::function<bool()>& done, int maxCycles = 20000) {
     for (int i = 0; i < maxCycles; ++i) {
         a.poll(1);
@@ -104,6 +129,10 @@ void testAsyncConvergence() {
     CHECK_EQ(primary.replicator->lastApplied(), Sequence{cmds.size()});
     // The whole point: identical state, never having shipped any state.
     CHECK_EQ(backup.engine.stateChecksum(), primary.engine.stateChecksum());
+    // And identical to what a single process would have computed. This
+    // is the assertion that catches a bug breaking both nodes the same
+    // way, which agreement alone cannot see.
+    CHECK_EQ(primary.engine.stateChecksum(), referenceChecksum(cmds));
     CHECK_EQ(backup.engine.book().checksum(), primary.engine.book().checksum());
     CHECK_EQ(primary.replicator->stats().checksumMismatches, std::uint64_t{0});
 
@@ -124,6 +153,7 @@ void testSyncConvergenceAndCommitSemantics() {
     replicateAll(primary, backup, cmds);
 
     CHECK_EQ(backup.engine.stateChecksum(), primary.engine.stateChecksum());
+    CHECK_EQ(primary.engine.stateChecksum(), referenceChecksum(cmds));
     CHECK_EQ(primary.replicator->lastApplied(), Sequence{cmds.size()});
     CHECK_EQ(backup.replicator->lastApplied(), Sequence{cmds.size()});
 
@@ -179,9 +209,25 @@ void testCatchUpAfterDisconnect() {
         }
         primary.poll(0);
     }
-    // Async: the primary is not blocked by a dead backup.
+    // The leader keeps ACCEPTING work into its log while the backup is
+    // gone. It does not block.
     CHECK_EQ(acceptedWhileDown, std::size_t{1600});
-    CHECK_EQ(primary.replicator->lastApplied(), Sequence{2400});
+    CHECK_EQ(primary.log.lastSeq(), Sequence{2400});
+
+    // But it does NOT apply any of it, and this is the Phase 5 change
+    // that matters most.
+    //
+    // Phase 3 applied on submit, so a leader that crashed after applying
+    // but before replicating would have shown a client a trade that no
+    // surviving node had. Now an entry is applied only once a MAJORITY
+    // holds it. This cluster is configured as two nodes, and a majority
+    // of two is two, so with the backup dead nothing can commit.
+    //
+    // That is not a limitation of the code, it is arithmetic, and it is
+    // exactly why real clusters use odd sizes: two nodes tolerate ZERO
+    // failures, the same as one. Three tolerate one.
+    CHECK_EQ(primary.replicator->lastApplied(), Sequence{800});
+    CHECK_EQ(primary.replicator->commitIndex(), Sequence{800});
 
     // Phase 3: a fresh backup takes the same address and must catch up
     // from scratch, replaying all 2400 commands it never saw.
@@ -197,7 +243,10 @@ void testCatchUpAfterDisconnect() {
         primary, backup2,
         [&] { return backup2.replicator->lastApplied() == primary.log.lastSeq(); }, 60000);
     CHECK(converged);
+    // With a majority available again, everything the leader accepted
+    // while alone commits and both nodes apply it.
     CHECK_EQ(backup2.replicator->lastApplied(), Sequence{2400});
+    CHECK_EQ(primary.replicator->lastApplied(), Sequence{2400});
     // Converged to identical state despite having missed everything.
     CHECK_EQ(backup2.engine.stateChecksum(), primary.engine.stateChecksum());
     CHECK(primary.replicator->stats().catchUpBatches > 0);
@@ -219,7 +268,7 @@ void testGapDetection() {
     net::AppendEntries msg;
     msg.leaderId = 1;
     msg.prevSeq = 50;  // backup is at 0, so this is a gap of 50
-    msg.entries.push_back(net::LogRecord{51, support::limit(1, Side::Buy, 100, 10)});
+    msg.entries.push_back(net::LogRecord{51, 1, support::limit(1, Side::Buy, 100, 10)});
     backup.replicator->onMessage(1, Message{msg});
 
     CHECK_EQ(backup.replicator->lastApplied(), Sequence{0});
@@ -230,7 +279,14 @@ void testGapDetection() {
     net::AppendEntries good;
     good.leaderId = 1;
     good.prevSeq = 0;
-    good.entries.push_back(net::LogRecord{1, support::limit(1, Side::Buy, 100, 10)});
+    // A follower now applies only up to the leader's commit point, never
+    // to the end of its own log. Entries past the commit point may still
+    // be truncated after a leader change, and applying them early would
+    // let a client observe a trade that later un-happens. So the leader
+    // must say what is committed; without this the entry is appended to
+    // the log and correctly not applied.
+    good.commitSeq = 1;
+    good.entries.push_back(net::LogRecord{1, 0, support::limit(1, Side::Buy, 100, 10)});
     backup.replicator->onMessage(1, Message{good});
     CHECK_EQ(backup.replicator->lastApplied(), Sequence{1});
     CHECK_EQ(backup.engine.book().orderCount(), std::size_t{1});
@@ -266,11 +322,131 @@ void testNoMessageAmplification() {
 
     // And the message count stays proportional. Before the fix this was
     // roughly 900 times the command count.
-    CHECK(ts.messagesSent < std::uint64_t{2200});
+    //
+    // The bound rose from ~1 message per command in Phase 3 to ~2 in
+    // Phase 5, and the extra one is real work rather than waste: after
+    // an entry is acknowledged the leader commits it, and the follower
+    // has to be TOLD the commit point moved or it never applies what it
+    // already holds. Measured: exactly 2.00 messages and 1.00 entries
+    // per command, so nothing is being re-sent. A real deployment folds
+    // this into the election heartbeat instead of sending it separately.
+    CHECK(ts.messagesSent < std::uint64_t{2000 * 2 + 200});
 
     // Bytes on the wire stay proportional too: a command encodes to a
     // few dozen bytes, so a few hundred KB is generous for 2,000.
     CHECK(ts.bytesSent < std::uint64_t{400000});
+}
+
+// LOG MATCHING. A follower must check the TERM at prevSeq, not just the
+// sequence number. Nothing exercised this until the mutation harness
+// pointed out that removing the term comparison changed no test result.
+//
+// It went unguarded because no test ever produced divergent logs, and
+// divergence needs a leader change writing a different entry at a
+// sequence another node already holds. So the conflict is injected
+// directly rather than staged through an election.
+void testLogMatchingRejectsAWrongTerm() {
+    Node follower(2, Role::Backup, ReplicationMode::Asynchronous);
+    follower.replicator->setTerm(2);
+
+    // Give it three entries from term 2.
+    net::AppendEntries first;
+    first.term = 2;
+    first.leaderId = 1;
+    first.prevSeq = 0;
+    first.prevTerm = 0;
+    first.commitSeq = 3;
+    for (std::uint64_t i = 1; i <= 3; ++i) {
+        first.entries.push_back(
+            net::LogRecord{i, 2, support::limit(i, Side::Buy, static_cast<Price>(100 + i), 5)});
+    }
+    follower.replicator->onMessage(1, Message{first});
+    CHECK_EQ(follower.log.lastSeq(), Sequence{3});
+    CHECK_EQ(follower.replicator->lastApplied(), Sequence{3});
+
+    // A leader claiming the entry at seq 3 was written in term 9. It was
+    // not: this follower holds a different entry there. Accepting would
+    // splice two histories together and produce a book that never
+    // existed on any node.
+    const auto before = follower.replicator->stats().logMatchRejections;
+    net::AppendEntries wrongTerm;
+    wrongTerm.term = 9;
+    wrongTerm.leaderId = 3;
+    wrongTerm.prevSeq = 3;
+    wrongTerm.prevTerm = 9;  // we have term 2 there
+    wrongTerm.commitSeq = 3;
+    wrongTerm.entries.push_back(net::LogRecord{4, 9, support::limit(99, Side::Sell, 500, 5)});
+    follower.replicator->setTerm(9);
+    follower.replicator->onMessage(3, Message{wrongTerm});
+
+    CHECK_EQ(follower.replicator->stats().logMatchRejections, before + 1);
+    // Rejected, so nothing was appended.
+    CHECK_EQ(follower.log.lastSeq(), Sequence{3});
+
+    // The same message with the correct prevTerm is accepted.
+    net::AppendEntries rightTerm = wrongTerm;
+    rightTerm.prevTerm = 2;
+    follower.replicator->onMessage(3, Message{rightTerm});
+    CHECK_EQ(follower.log.lastSeq(), Sequence{4});
+}
+
+// RAFT FIGURE 8. A leader may not commit an entry from a PREVIOUS term
+// just because a majority now holds it.
+//
+// This is the subtlest rule in the project and it was completely
+// unguarded: removing the check changed no test result. It went unnoticed
+// because reaching the situation naturally needs a specific multi-term
+// sequence of partial replications and elections, so it is constructed
+// directly here instead.
+void testLeaderWillNotCommitAPreviousTermsEntry() {
+    Node leader(1, Role::Primary, ReplicationMode::Asynchronous);
+    leader.replicator->setClusterSize(3);
+
+    // Three entries left over from term 2, as a previous leader wrote
+    // them and this node inherited them.
+    for (int i = 1; i <= 3; ++i) {
+        leader.log.append(support::limit(static_cast<OrderId>(i), Side::Buy, 100 + i, 5), 2);
+    }
+    // We are now leading term 5.
+    leader.replicator->setTerm(5);
+    CHECK_EQ(leader.replicator->commitIndex(), Sequence{0});
+
+    // Both followers report holding all three. That is a majority of
+    // three, so the naive rule would commit them.
+    for (NodeId peer : {NodeId{2}, NodeId{3}}) {
+        net::AppendResponse ack;
+        ack.term = 5;
+        ack.nodeId = peer;
+        ack.lastLogSeq = 3;
+        ack.ok = true;
+        ack.lastApplied = 0;
+        leader.replicator->onMessage(peer, Message{ack});
+    }
+
+    // And it must NOT. A majority holding an old entry does not make it
+    // safe, because a future leader could still be elected without it.
+    // Raft's Figure 8 is the five-node schedule where committing here
+    // lets a committed entry be overwritten later.
+    CHECK_EQ(leader.replicator->commitIndex(), Sequence{0});
+    CHECK_EQ(leader.replicator->lastApplied(), Sequence{0});
+
+    // Now the leader appends an entry in its OWN term and a majority
+    // takes it. That entry is safe to commit, and committing it carries
+    // the earlier ones with it. This is how old entries become committed:
+    // never directly, always in the wake of a current-term entry.
+    leader.log.append(support::limit(4, Side::Sell, 200, 5), 5);
+    for (NodeId peer : {NodeId{2}, NodeId{3}}) {
+        net::AppendResponse ack;
+        ack.term = 5;
+        ack.nodeId = peer;
+        ack.lastLogSeq = 4;
+        ack.ok = true;
+        ack.lastApplied = 0;
+        leader.replicator->onMessage(peer, Message{ack});
+    }
+    CHECK_EQ(leader.replicator->commitIndex(), Sequence{4});
+    CHECK_EQ(leader.replicator->lastApplied(), Sequence{4});
+    CHECK_EQ(leader.engine.book().orderCount(), std::size_t{4});
 }
 
 void testLogCompaction() {
@@ -301,6 +477,8 @@ void run() {
     testBackupRefusesClientCommands();
     testGapDetection();
     testNoMessageAmplification();
+    testLogMatchingRejectsAWrongTerm();
+    testLeaderWillNotCommitAPreviousTermsEntry();
     testCatchUpAfterDisconnect();
     testLogCompaction();
 }
