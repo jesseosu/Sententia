@@ -89,11 +89,31 @@ void testSendRefusesRatherThanQueueingForever() {
     CHECK(accepted > 0);
     CHECK_EQ(accepted + refused, cmds.size());
     CHECK(a.stats().sendsRefusedOverflow > 0);
-    CHECK(a.isSaturated(2));
+
+    // Nothing is asserted about the queue depth AT THIS INSTANT, and the
+    // reason is worth recording because I got it wrong twice.
+    //
+    // First I asserted isSaturated(2). It flaked about one Debug run in
+    // four, because send() drains any writable backlog before checking,
+    // so the kernel may have just accepted enough bytes to drop the
+    // queue below the mark on the final call. I replaced it with
+    // pendingBytes(2) > 0, which is the same mistake one line lower, and
+    // it flaked at exactly the same rate.
+    //
+    // Instantaneous queue depth is a property of what the kernel felt
+    // like doing in the last microsecond. The property actually under
+    // test is that the queue stays BOUNDED and that refusals are
+    // reported, and peakPending, refused and sendsRefusedOverflow above
+    // establish both. peakPending is accumulated across the whole loop
+    // rather than sampled once, which is what makes it trustworthy.
+    //
+    // Same family as asserting a short write on loopback in Phase 2:
+    // bounding a test by something the environment controls.
 
     // Once the backup resumes reading, the sender recovers: pressure is
-    // relieved and sends are accepted again.
-    for (int i = 0; i < 4000 && a.isSaturated(2); ++i) {
+    // relieved and sends are accepted again. Driven in a loop until the
+    // condition clears, rather than sampled once.
+    for (int i = 0; i < 8000 && a.isSaturated(2); ++i) {
         a.poll(1);
         b.poll(1);
     }

@@ -268,10 +268,26 @@ void testPartialWriteAgainstRealSocket() {
     std::vector<Byte> sink(65536);
     std::size_t received = 0;
     bool corrupted = false;
-    for (int i = 0; i < 10000; ++i) {
+    // Retry on WouldBlock rather than giving up at the first one.
+    //
+    // The previous version broke out immediately, which assumed the
+    // bytes were already sitting in the receive buffer. On Linux
+    // loopback they are. On macOS they may not be yet, so the first read
+    // returned WouldBlock, the loop exited having read nothing, and
+    // `received > 0` failed. That broke CI on macOS for five commits.
+    //
+    // Same mistake as the short-write assertion and the saturation
+    // check: an assertion bounded by how fast the local network stack
+    // happens to be. Bounded by iterations here, never by a sleep.
+    int emptyReads = 0;
+    for (int i = 0; i < 200000 && emptyReads < 20000; ++i) {
         const IoResult r = server.read(sink.data(), sink.size());
         if (r.status == IoStatus::WouldBlock) {
-            break;
+            ++emptyReads;
+            if (received > 0 && emptyReads > 1000) {
+                break;  // drained what was sent
+            }
+            continue;
         }
         if (r.status != IoStatus::Ok) {
             break;

@@ -25,3 +25,20 @@ N 8 SELL LIMIT IOC 150 5
 # Rebuild and cross exactly.
 N 9  BUY  LIMIT GTC 99 20
 N 10 SELL LIMIT GTC 99 40
+
+# Price improvement: a buyer willing to pay 110 meets a seller asking
+# 105, and the trade must print at 105. The aggressor accepted the
+# resting order's terms, so the improvement is theirs.
+#
+# Added because the earlier file happened to cross every order at an
+# identical price, so it could not have detected the execution price
+# rule changing at all. A canary that cannot see a whole class of change
+# is a weak canary.
+N 11 SELL LIMIT GTC 105 10
+N 12 BUY  LIMIT GTC 110 10
+
+# Time priority across two resting orders at one price, so a change to
+# the FIFO rule also moves these checksums.
+N 13 BUY LIMIT GTC 100 5
+N 14 BUY LIMIT GTC 100 5
+N 15 SELL LIMIT GTC 100 5
