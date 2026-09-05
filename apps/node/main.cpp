@@ -427,9 +427,24 @@ int main(int argc, char** argv) {
             if (replicator.role() == Role::Primary) {
                 // Everything submitted, applied locally, and confirmed
                 // held by every backup.
+                // "Done" in a replicated system means the CLUSTER is
+                // done, not that this node is. Checking only our own
+                // applied index lets the leader exit while a follower
+                // is still one commit-advertisement behind, and the
+                // follower then reports a smaller state than the
+                // leader. That was an intermittent demo failure, about
+                // one run in eight, and it is a real distributed-systems
+                // boundary rather than a test artifact.
+                bool backupsCaughtUp = replicator.hasBackup();
+                for (const BackupState& b : replicator.backups()) {
+                    if (b.lastApplied != log.lastSeq()) {
+                        backupsCaughtUp = false;
+                    }
+                }
                 complete = everConnected && nextOrder == orders.size() &&
                            replicator.lastApplied() == log.lastSeq() &&
-                           replicator.commitSeq() == log.lastSeq() && log.lastSeq() > 0;
+                           replicator.commitSeq() == log.lastSeq() && backupsCaughtUp &&
+                           log.lastSeq() > 0;
             } else {
                 // The primary finished and went away.
                 complete = everConnected && transport.readyPeerCount() == 0;
