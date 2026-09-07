@@ -7,23 +7,25 @@ deterministic recovery from node failure, extending the single-process
 [Celeritas](https://github.com/jesseosu/celeritas) engine into a
 clustered, crash-resilient system.
 
-**Status: Phase 4 complete.** The cluster elects its own leader, detects
-when the leader dies, and elects a replacement, with no split-brain
-across 115 randomised fault schedules. Durable recovery is Phase 5.
+**Status: Phase 5 complete.** State survives power loss, a crashed node
+recovers to exactly the state it was in, and a leader can die mid-stream
+without losing anything a client was told succeeded. Benchmarking and
+hardening are Phase 6.
 
 ---
 
 ## What exists today
 
 **A deterministic matching engine** (Phase 1), **a framed TCP transport**
-(Phase 2), **state-machine replication** on top of both (Phase 3), and
+(Phase 2), **state-machine replication** on top of both (Phase 3),
 **Raft-style leader election** deciding who does the replicating
-(Phase 4).
+(Phase 4), and **durability plus crash recovery** underneath all of it
+(Phase 5).
 
 The end-to-end proof that it works is a single number. Replaying the same
 order file through the single-process driver, through a synchronous
 primary/backup pair, and through an asynchronous one all produce the
-state checksum `17373410596180621386`. Neither node ever sent the other a
+state checksum `17441047841503333197`. Neither node ever sent the other a
 book.
 
 ### The engine
@@ -179,6 +181,46 @@ report split-brain immediately with named reproducible seeds.
 [`docs/consensus.md`](docs/consensus.md) covers terms, quorums, why
 randomised timeouts are load-bearing, and the election restriction.
 
+### Durability and recovery
+
+Three files per node: the term and vote, the command log, and a snapshot.
+The rule that makes them worth anything is ordering, not format: a
+command reaches disk and is **flushed before** it is treated as
+committed. A crash then leaves everything a client was told about on
+disk, and anything not on disk was never acknowledged.
+
+Every log record carries a CRC, because a crash mid-write leaves a
+half-record that reads back as garbage shaped like data. Recovery replays
+until a record fails to verify, then truncates. A torn tail is the normal
+outcome of a crash, not an error.
+
+Recovery is **not a special code path**. It loads a snapshot and then runs
+the ordinary apply loop, fed from disk instead of a socket. That only
+works because the engine is deterministic, which is Phase 1 paying off
+for the fourth time.
+
+The durability dial, measured:
+
+| Policy | fsyncs per 100 appends | A power cut loses |
+|--------|------------------------|-------------------|
+| `EveryWrite` | 100 | nothing acknowledged |
+| `Batched` (N=10) | 10 | up to 9 acknowledged commands |
+| `Never` | 0 | everything not yet flushed |
+
+**The commit rule changed too, and it matters.** Phase 3 committed when
+every backup held an entry, so one dead backup stalled the cluster.
+Phase 5 commits on a **majority**, plus Raft's Figure 8 restriction that a
+leader may only advance the commit point to an entry from its own term.
+
+A consequence worth stating: **a two-node cluster tolerates zero
+failures**, because a majority of two is two. `test_replication` asserts
+this directly, and the old expectation it replaced was the unsafe one.
+
+[`docs/recovery.md`](docs/recovery.md) covers write-ahead ordering, torn
+writes, atomic file replacement, snapshots and the gap they create, log
+matching with per-entry terms, and why truncating a follower's log is
+safe.
+
 ```bash
 ./scripts/election_demo.sh ./build/node
 ```
@@ -198,7 +240,7 @@ election demo OK
 ```
 replication demo OK (mode=sync)
   commands applied on both nodes: 12
-  state checksum on both nodes:   17373410596180621386
+  state checksum on both nodes:   17441047841503333197
 ```
 
 ## Build and run
@@ -255,9 +297,9 @@ seq=17 cmd=6 TOB bid=100x3 ask=102x8
 ...
 commands=12
 events=34
-event_hash=9684792522070214564
-book_checksum=11753875096244137027
-state_checksum=17373410596180621386
+event_hash=10118579028301334196
+book_checksum=2780187635739378981
+state_checksum=17441047841503333197
 ```
 
 Because the output is byte-stable for a given input, the determinism
@@ -299,7 +341,7 @@ order, are in [`docs/domain-model.md`](docs/domain-model.md).
 
 ```
 $ ctest --test-dir build --output-on-failure
-100% tests passed, 0 tests failed out of 25
+100% tests passed, 0 tests failed out of 27
 ```
 
 | Test | Validates |
@@ -328,16 +370,57 @@ $ ctest --test-dir build --output-on-failure
 | `test_election` | States, terms, quorums, one vote per term, the election restriction, randomised timeouts |
 | `test_election_sim` | **No split-brain** across 115 randomised partition and crash schedules on 3, 5 and 7 nodes |
 | `election_demo` | Three real processes, leader killed, replacement elected in a higher term |
+| `test_durability` | WAL round trips, **torn writes**, corrupted payloads, sync policies, snapshot round trips |
+| `test_recovery` | Restart replays to the identical checksum, snapshot-bounded recovery, **crash between snapshot and truncation**, durable votes, leader crash losing nothing committed |
 
 `test_invariants` alone makes about 224,000 assertions.
+
+### Checking the tests themselves
+
+A green suite proves the tests agree with the code, which is also true
+when both are wrong, and true when a test cannot observe the thing it is
+named after. This project has shipped two tests that passed while being
+structurally incapable of failing. So there are three gates on the tests:
+
+```bash
+make mutants   # break the code 20 ways, assert a named test notices each
+make flake     # run the suite 10 times, fail if any run differs
+make asan      # ASan and UBSan, because assertions cannot see memory errors
+```
+
+`make mutants` runs a registry of 20 mutations, each attacking a property
+the project actually claims. **Its first run found four invariants that
+nothing was guarding**, including Raft's Figure 8 rule, which is the
+subtlest correctness property here and was documented at length and
+tested by nothing. It also found dead code, because a mutation landed on
+a function nothing called any more.
+
+```
+$ make mutants
+  killed   election-majority-of-one      by test_election_sim, test_election
+  killed   recovery-double-applies-at-boundary   by test_recovery
+  ...
+killed 20  survived 0  broken 0
+```
+
+`make flake` exists because the most repeated mistake in this project,
+four times across five phases, was bounding a test by something the
+environment controls: a short write that only happens when kernel buffers
+are small, a cycle budget that expires under load, a queue depth sampled
+at one instant. A single green run cannot tell "correct" from "correct on
+this machine when nothing else was happening".
+
+[`docs/testing-standards.md`](docs/testing-standards.md) has the rules,
+each one written because it was broken first.
 
 ### CI
 
 GitHub Actions builds and tests on GCC, Clang, MSVC and Apple Clang with
-`-Werror`, checks formatting, and then does something more specific: it
-replays the same order file on Linux, Windows and macOS and **fails if
-the resulting checksums differ**. A determinism property that holds only
-on the machine it was developed on is not the property Phase 3 needs.
+`-Werror`, checks formatting, runs all three gates above, and then does
+something more specific: it replays the same order file on Linux, Windows
+and macOS and **fails if the resulting checksums differ**. A determinism
+property that holds only on the machine it was developed on is not the
+property Phase 3 needs.
 
 ## Baseline performance
 
@@ -369,16 +452,19 @@ include/sententia/       engine headers: types, command, event, order_book, engi
 include/sententia/net/   transport headers: wire, message, framing, socket, transport
 include/sententia/replication/  command log and replicator
 include/sententia/consensus/    leader election state machine
+include/sententia/storage/      write-ahead log, stable store, snapshots
 src/                     the pure core. no I/O, no clock, no threads, no RNG
 src/net/                 the transport. POSIX sockets and poll()
 src/replication/         state-machine replication
 src/consensus/           leader election. no socket, no clock, no thread
+src/storage/             durability. the only place that touches a disk
 apps/replay/             command-file replay driver (the I/O edge)
 apps/node/               cluster node binary: engine + log + transport + replicator
 bench/                   single-node baseline benchmark (the timing edge)
 tests/                   one executable per test, a ~60-line harness, and a
                          deterministic cluster simulator (sim.hpp)
-scripts/                 sample orders, cluster configs, demo and determinism checks
+scripts/                 sample orders, cluster configs, demos, and the
+                         mutation and flake gates
 docs/                    domain model, determinism contract, wire protocol, phase reports
 ```
 
@@ -402,13 +488,19 @@ clock, RNG, socket, or file handle belongs on the outside of that line.
 - [`docs/consensus.md`](docs/consensus.md) - terms, quorums, why
   randomised timeouts are load-bearing, the election restriction, and the
   per-term invariant.
+- [`docs/recovery.md`](docs/recovery.md) - write-ahead ordering, torn
+  writes, snapshots, per-entry terms, the majority commit rule and the
+  Figure 8 restriction.
+- [`docs/testing-standards.md`](docs/testing-standards.md) - how the
+  tests are checked, and the rule behind each gate.
 - [`docs/failure-modes.md`](docs/failure-modes.md) - a running catalogue
   of every bug and near-miss, with symptom, cause, fix, and what catches
   it now. Worth reading before the phase reports.
 - [`docs/phase-1-report.md`](docs/phase-1-report.md),
   [`docs/phase-2-report.md`](docs/phase-2-report.md) and
   [`docs/phase-3-report.md`](docs/phase-3-report.md) and
-  [`docs/phase-4-report.md`](docs/phase-4-report.md) - each phase checked
+  [`docs/phase-4-report.md`](docs/phase-4-report.md) and
+  [`docs/phase-5-report.md`](docs/phase-5-report.md) - each phase checked
   against its definition of done, with the gaps carried forward.
 
 ## Roadmap
@@ -420,8 +512,8 @@ clock, RNG, socket, or file handle belongs on the outside of that line.
 | 2 | Networking layer: TCP message passing between nodes | **Done** |
 | 3 | State replication, primary to backup | **Done** |
 | 4 | Leader election | **Done** |
-| 5 | Fault-tolerant recovery | Next |
-| 6 | Benchmarking and hardening | |
+| 5 | Fault-tolerant recovery | **Done** |
+| 6 | Benchmarking and hardening | Next |
 | 7 | Documentation and writeup | |
 
 Phases 3 to 5 are the actual distributed-systems content. Phases 0 to 2

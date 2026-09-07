@@ -114,6 +114,44 @@ jobs:
           done
           echo "all platforms agree"
 
+  # Prove the tests can fail. See docs/testing-standards.md.
+  mutation:
+    name: mutation testing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Break the code 20 ways and assert the tests notice
+        run: ./scripts/mutation_check.py --jobs 4
+
+  # Prove the tests pass for reasons in the code rather than reasons in
+  # the machine.
+  flake:
+    name: repeat runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j 4
+      - name: Run the suite ten times
+        run: ./scripts/flake_check.sh 10 build
+
+  # Assertions cannot see memory errors.
+  sanitizers:
+    name: ASan and UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with sanitizers
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSENTENTIA_SANITIZE=ON
+          cmake --build build-asan -j 4
+      - name: Test
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build-asan --output-on-failure
+
   format:
     name: clang-format
     runs-on: ubuntu-latest

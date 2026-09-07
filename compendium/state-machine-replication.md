@@ -103,7 +103,7 @@ The state checksum walks the book in canonical order and is a function of state 
 
 Best of all, catch-up correctness was already proven. Phase 1 had a prefix-replay test: apply a third of a sequence, then the rest, and require the result to equal applying it all at once. I wrote it as a down payment on Phase 5 recovery. It turned out to be exactly the property catch-up needs, three phases early.
 
-The end-to-end confirmation is one number. Replaying the same order file through the single-process driver, through a synchronous pair, and through an asynchronous pair gives the same state checksum, `17373410596180621386`, on all three.
+The end-to-end confirmation is one number. Replaying the same order file through the single-process driver, through a synchronous pair, and through an asynchronous pair gives the same state checksum, `17441047841503333197`, on all three.
 
 ## What surprised me
 

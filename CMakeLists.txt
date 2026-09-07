@@ -15,6 +15,14 @@ endif()
 
 option(SENTENTIA_WERROR "Treat warnings as errors" ON)
 
+# Address and undefined-behaviour sanitizers.
+#
+# Added after mutation testing found a bounds check whose removal changed
+# no test result: the read ran past the end of a buffer, and every
+# assertion still passed because the garbage happened to fail a checksum
+# anyway. Assertions cannot see memory errors. A sanitizer can.
+option(SENTENTIA_SANITIZE "Build with ASan and UBSan" OFF)
+
 add_library(sententia_flags INTERFACE)
 if(MSVC)
     target_compile_options(sententia_flags INTERFACE /W4 /permissive-)
@@ -26,6 +34,11 @@ else()
         -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion)
     if(SENTENTIA_WERROR)
         target_compile_options(sententia_flags INTERFACE -Werror)
+    endif()
+    if(SENTENTIA_SANITIZE)
+        target_compile_options(sententia_flags INTERFACE
+            -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+        target_link_options(sententia_flags INTERFACE -fsanitize=address,undefined)
     endif()
 endif()
 
@@ -50,7 +63,11 @@ if(UNIX)
         src/net/transport.cpp
         src/replication/command_log.cpp
         src/replication/replicator.cpp
-        src/consensus/election.cpp)
+        src/consensus/election.cpp
+        src/storage/wal.cpp
+        src/storage/stable_store.cpp
+        src/storage/snapshot.cpp
+        src/storage/durable_state.cpp)
     target_include_directories(sententia_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(sententia_net PUBLIC sententia_core PRIVATE sententia_flags)
 
@@ -95,7 +112,9 @@ set(SENTENTIA_NET_TESTS
     test_replication
     test_replication_chaos
     test_election
-    test_election_sim)
+    test_election_sim
+    test_durability
+    test_recovery)
 
 foreach(test_name IN LISTS SENTENTIA_TESTS)
     add_executable(${test_name} tests/${test_name}.cpp)
@@ -140,8 +159,15 @@ endif()
 # Replaying the sample order file twice must produce identical output.
 # This is the determinism property checked end to end, through the real
 # I/O path, rather than in process.
+# Replaying the sample order file must be repeatable AND must produce
+# these exact values. The first half catches non-determinism; the second
+# catches a silent change in matching semantics, which repeatability
+# alone cannot see because both runs would change together.
 add_test(NAME replay_sample
          COMMAND ${CMAKE_COMMAND}
                  -DREPLAY=$<TARGET_FILE:replay>
                  -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/scripts/sample_orders.txt
+                 -DEXPECT_EVENT_HASH=10118579028301334196
+                 -DEXPECT_BOOK_CHECKSUM=2780187635739378981
+                 -DEXPECT_STATE_CHECKSUM=17441047841503333197
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/scripts/replay_determinism.cmake)

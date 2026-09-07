@@ -312,17 +312,396 @@ read.
 
 ---
 
+## 10. An edit that reported success and changed nothing, twice
+
+**Phase 4. Symptom:** the "Open, deliberately" list below still claimed
+"No failover. A backup never becomes a primary. Phase 4" *after* Phase 4
+had shipped working failover. The Phase 4 gaps that were supposed to
+replace it were absent entirely.
+
+**Cause:** the same one as defect 9, one document later. The update was a
+text substitution anchored on two adjacent lines, and a third bullet sat
+between them, so the pattern did not match. The tool reported success. It
+changed nothing.
+
+**Why it mattered:** less than the decoder bug, because stale docs do not
+corrupt data. But it was caught only because somebody asked "are these
+actually resolved?" and the honest answer required rereading rather than
+remembering. A catalogue of known gaps that silently goes stale is worse
+than no catalogue, because it is trusted.
+
+The compounding detail: this is the **third** instance this phase of an
+edit whose anchor drifted, and it landed in the document whose entire job
+is recording that class of mistake.
+
+**Fix:** the missing content, plus a habit. Substitution-based edits now
+assert their anchor exists before rewriting, so a stale pattern is a hard
+failure rather than a silent no-op:
+
+```python
+assert old in s, "anchor not found"
+s = s.replace(old, new)
+```
+
+Every other Phase 4 documentation and build edit was then audited the
+same way: 16 markers checked, 15 present, 1 missing. This was the one.
+
+**The general lesson:** an edit that cannot fail is an edit you cannot
+trust. Whether the tool is `sed`, a script, or a person, "I changed it"
+and "it changed" are different claims, and only the second one matters.
+Verify the change landed, not that the command exited zero.
+
+---
+
+## 11. Two correct rules that deadlocked together
+
+**Phase 5. Symptom:** the entire suite hung after switching to majority
+commit. No error, no crash, no output.
+
+**Cause:** each follower's **applied** index was used as its match point
+for the commit calculation. But a follower applies only what the leader
+has told it is committed, and the leader cannot know an entry is
+committed until followers report holding it. Each waits for the other.
+
+**Why it was hard:** both rules are individually correct. Followers must
+apply only committed entries, or a client can observe a trade that later
+un-happens. Commit means what a majority holds. The bug lives only in the
+interaction, and the symptom is silence.
+
+**Fix:** the match point is the follower's **log head**, not its applied
+index. Holding an entry and having applied it are different facts.
+
+**Caught now by:** every replication test, which hang without it.
+
+---
+
+## 12. A follower permanently one entry behind
+
+**Phase 5. Symptom:** replication converged for every entry except the
+last, forever.
+
+**Cause:** the leader learns a follower holds entry N, commits N, then
+has nothing left to send, so the new commit point is never advertised.
+Invisible mid-burst because the next entry carries it; fatal at the end
+of a burst.
+
+**Fix:** track the commit point each follower has been told and send an
+empty append when it moves. Real Raft folds this into the heartbeat.
+
+**Cost, measured:** messages per command went from 1.00 to 2.00, entries
+per command stayed at 1.00, so nothing is re-sent.
+
+---
+
+## 13. A test that was structurally incapable of failing
+
+**Phase 5, and the most instructive one here. Symptom:** none.
+`testSnapshotEntriesAreNotAppliedTwice` passed, and kept passing when the
+boundary check was deliberately changed from `<=` to `<`.
+
+**Cause:** the snapshot function truncated the **entire** log, so after a
+snapshot no records at or before the boundary existed, no overlap
+occurred, and the skip logic never ran. The test set up a world where the
+bug could not manifest and confirmed it did not manifest. Its comment
+confidently described an overlap the setup made impossible.
+
+**Two fixes, because two things were wrong.** Truncating the whole log is
+only safe when the snapshot is at the log head, so truncation became
+partial. And the test now builds the realistic overlap: a crash between
+writing the snapshot and truncating the log, which is a real window
+created by writing the snapshot first (the safe order). It asserts
+exactly 500 entries replayed, not 501.
+
+**Caught now by:** `testCrashBetweenSnapshotAndTruncationDoesNotDoubleApply`,
+verified to fail on the off-by-one.
+
+**The lesson:** "does this test pass" and "can this test fail" are
+different questions and only the second is worth much.
+
+---
+
+## 14. An accessor correct only immediately after loading
+
+**Phase 5. Symptom:** partial truncation kept nothing; recovery reported
+zero entries replayed instead of 500.
+
+**Cause:** the WAL kept an in-memory vector of records populated during
+replay at open and never updated on append. Within a session it stayed
+empty however much was written.
+
+**Fix:** append updates the mirror.
+
+**The lesson:** a view of an object's contents should be correct at every
+point in its life, not just right after construction. The next caller of
+a load-only-correct accessor is always you, twenty minutes later.
+
+---
+
+## 15. Idempotency guards keyed on non-unique strings
+
+**Phase 5, and the third variant of defect 9 and 10.** Substitution edits
+were guarded with `if "lastLogSeq" not in source` to avoid applying twice.
+That field already existed on a different message type, so the guard saw
+it, concluded the edit was done, and skipped. Twice, on two files.
+
+**Fix:** stop guarding on substrings that are not unique to the thing
+being added. Assert the precise anchor, apply, verify afterwards.
+
+**The pattern across Phases 4 and 5:** five instances of a tool reporting
+success without doing the work, every one found by a compiler or a test
+rather than by reading the diff. The countermeasure that works is making
+the tool unable to fail quietly, not resolving to be more careful.
+
+---
+
+## 16. A demo that finished before the cluster did
+
+**Phase 5. Symptom:** one full-suite run in eight failed on
+`replication_demo_sync`.
+
+**Cause:** the leader's completion condition checked only its own applied
+index. Under the new commit rule the leader can be caught up while a
+follower is still one commit-advertisement behind, so it exited and the
+follower reported a smaller state.
+
+**Fix:** "done" in a replicated system means the cluster is done. The
+condition now requires every follower to have applied everything too.
+
+**Caught now by:** eight consecutive demo runs plus repeated full-suite
+runs, where the previous arrangement failed about one in eight.
+
+---
+
+## 17. The same instantaneous assertion mistake, twice in two minutes
+
+**Phase 5. Symptom:** `test_backpressure` failed about one Debug run in
+four on `CHECK(a.isSaturated(2))`.
+
+**Cause:** saturation is an instantaneous condition, and `send()` now
+drains any writable backlog before checking it, so the kernel may have
+accepted enough bytes on the final call to drop the queue below the
+high-water mark. The assertion was sampling a value the environment
+controls.
+
+**What makes this worth an entry:** I diagnosed it correctly, wrote a
+paragraph explaining that instantaneous conditions must not be asserted,
+and then replaced it with `CHECK(a.pendingBytes(2) > 0)`, which is the
+identical mistake one line lower. It flaked at exactly the same rate.
+
+**Fix:** assert nothing about the queue at a single instant. The property
+under test is that the queue stays **bounded** and that refusals are
+reported, and `peakPending` (accumulated across the whole loop),
+`refused`, and `sendsRefusedOverflow` already establish both. Twenty
+consecutive Debug runs clean afterwards, where the previous two versions
+failed three in twelve.
+
+**The pattern, now on its fourth appearance** (short writes on loopback,
+demo cycle budgets, and both of these): bounding a test by something the
+environment controls. Knowing the rule did not stop me applying the
+anti-pattern again while writing the comment that explains it.
+
+---
+
+## 18. Four invariants nothing was guarding, found in one command
+
+**Post-Phase-5. Symptom:** none. Everything was green.
+
+Defects 13 and 17 were both caught by manually breaking the code and
+checking a test noticed. That worked, and it depended entirely on
+remembering to do it, once per phase, on whichever code felt risky. It
+missed things for a whole phase at a time.
+
+So the sabotage check became a script: `scripts/mutation_check.py`, a
+registry of 20 named mutations, each attacking a property the project
+actually claims, each naming the test that must fail.
+
+**The first run killed 15 of 20.** The four survivors were invariants
+with no test behind them:
+
+| Survivor | The unguarded property |
+|----------|------------------------|
+| `commit-ignores-current-term-rule` | **Raft Figure 8.** The subtlest correctness rule in the project, documented at length, tested by nothing. |
+| `replication-ignores-log-matching` | A follower checking the term at `prevSeq`, not just the sequence. Nothing ever produced divergent logs. |
+| `replication-skips-a-command` | See below. |
+| `wal-ignores-short-payload` | A bounds check. Removing it read past a buffer and every assertion still passed. |
+
+Plus one registry entry that would not compile, which the harness
+correctly reported rather than skipping.
+
+**Fixes:** a Figure 8 test that constructs the multi-term situation
+directly, a log-matching test that injects a term conflict, an
+ASan/UBSan build (assertions cannot see memory errors), and the oracle
+described next. All 20 mutations are now killed.
+
+---
+
+## 19. Agreement is not correctness
+
+**Post-Phase-5. Symptom:** `replication-skips-a-command` survived. Making
+the apply loop drop one command in five hundred left every convergence
+test green.
+
+**Cause:** every replication assertion compared the leader against the
+follower and nothing else. Both nodes ran the same mutated code, skipped
+the same commands, and agreed perfectly on a book that was wrong.
+
+The tests checked **agreement**. Agreement is not correctness, and the
+distinction is invisible until something breaks both sides identically.
+
+**Fix:** a third party. Convergence tests now also compare against a
+single-process engine applying the same commands with no replication
+involved at all.
+
+**The general lesson:** whenever two things are checked against each
+other, ask what happens if both are wrong the same way. In a replicated
+system that question has teeth, because making both sides run identical
+code is the entire point.
+
+---
+
+## 20. A mutation that landed on dead code
+
+**Post-Phase-5.** After adding the oracle, `replication-skips-a-command`
+*still* survived.
+
+**Cause:** the mutation anchor matched two places, and the first was
+`Replicator::applyThrough`, a function left over from the Phase 3 commit
+model that nothing had called since. The mutation dutifully broke dead
+code and no test noticed, which is correct behaviour and completely
+uninformative.
+
+**Two fixes.** The dead function is gone. And an anchor matching more
+than one place is now a hard failure in the harness rather than a silent
+first-match: a mutation that can land anywhere can land somewhere
+harmless, and the result is indistinguishable from a test that would have
+caught it.
+
+**Worth noting:** this is the same failure shape as defects 9, 10 and 15,
+where an edit silently matched nothing. Here it silently matched the
+wrong thing. Both are a tool doing something other than what was intended
+and reporting success, and the countermeasure is the same: make ambiguity
+an error rather than a coin flip.
+
+---
+
+## 21. A number quoted as evidence for five phases, asserted nowhere
+
+**Post-Phase-5. Symptom:** none. Prompted by being asked whether the
+unchanging replay checksum was a concern.
+
+For five phases every status report ended with the same reassurance:
+Phase 1's replay checksum is still `17373410596180621386`, therefore
+nothing regressed. The checksum being stable was correct and expected,
+since later phases add transport, replication, election and durability
+without touching matching semantics.
+
+**The problem was the evidence, not the number.** That value was asserted
+in no test anywhere. It was being compared by eye across messages.
+
+The `replay_sample` test that looked like it guarded this only ran the
+replay driver twice and checked the two runs agreed **with each other**.
+Change the matching rules and both runs change together, agree perfectly,
+and the test still passes. Exactly the trap defect 19 describes, sitting
+undetected in the one check most often cited as proof nothing had broken.
+
+Engine behaviour was not actually unguarded, because `test_determinism`
+pins a golden 22-event stream. But the specific claim being repeated had
+nothing behind it.
+
+**Fix, in two parts.**
+
+The three checksums are now pinned as golden values passed into the test,
+so a semantics change fails rather than drifts. Verified by feeding a
+deliberately wrong expected value and confirming it fires.
+
+And the sample order file was strengthened, because pinning a weak input
+pins very little. Every crossing in the old file happened at an identical
+price, so it could not have detected the execution-price rule changing at
+all: a mutation trading at the aggressor's price instead of the resting
+price left its output byte-identical. The file now includes a genuine
+price-improvement crossing (a buyer at 110 meeting an ask at 105, which
+must print at 105) and two resting orders at one price to exercise FIFO.
+
+With that, the mutation `engine-trades-at-the-wrong-price` is killed by
+`replay_sample`. Before, it was invisible to it.
+
+**The lesson, and it is uncomfortable:** the reassurance was being
+generated by the same process that would have missed the regression. A
+number repeated confidently in a status report is not a test. If it is
+worth quoting as evidence, it is worth asserting, and if the input behind
+it is trivial then the assertion is worth very little either way.
+
+---
+
+## 22. CI red for five commits while every report said green
+
+**Post-Phase-5. Symptom:** the branch had a failing check on GitHub from
+the Phase 4 commit onward. Five consecutive pushes, all reported here as
+verified and green.
+
+**Cause, in two parts.**
+
+The *reporting* failure is the serious one. Every phase was verified
+locally on Linux with GCC and Clang, Release and Debug, and reported as
+such truthfully. GitHub Actions also builds on **macOS and Windows**, and
+that was never once looked at. "Verified on the platforms I ran" was
+stated as if it were "verified", and the gap between those went
+unmentioned because it went unnoticed.
+
+The *technical* failures were two genuine bugs, both macOS-only:
+
+**`fdatasync` does not exist on macOS.** Introduced in Phase 5 and broke
+the build outright. Now `#if defined(__APPLE__)` uses `fsync`. Worth
+noting while there: on Apple hardware even `fsync` only pushes to the
+drive rather than through its write cache, and `F_FULLFSYNC` is the
+stronger primitive a real venue would want, at a real cost.
+
+**A read loop that gave up at the first `WouldBlock`.** From Phase 4:
+
+```cpp
+if (r.status == IoStatus::WouldBlock) {
+    break;   // assumes the bytes have already arrived
+}
+```
+
+On Linux loopback they have. On macOS they may not be there yet, so the
+loop exited having read nothing and `received > 0` failed. Now it
+retries, bounded by iterations.
+
+That is the **fifth** instance of an assertion bounded by something the
+environment controls, and the first one to be caught by a platform
+rather than by luck. The pattern held: knowing the rule did not prevent
+it, and the thing that eventually found it was a machine that behaved
+differently.
+
+**Fix, beyond the two bugs:** CI results are now checked before a phase
+is reported complete, not just the local suite. `make flake` and `make
+mutants` were built to check the tests; nothing was checking that the
+checks themselves were passing where they actually run.
+
+---
+
 ## Open, deliberately
 
 Things known to be wrong or missing, listed so they read as decisions.
 
-- **No snapshots.** A backup that falls behind further than the retained
-  log cannot catch up by replay. `CommandLog::canServeFrom` detects the
-  condition and the replicator logs it plainly rather than sending a gap.
-  Phase 5.
-- **No durability.** The log is in memory. A primary that dies loses it.
-  Phase 5.
-- **No failover.** A backup never becomes a primary. Phase 4.
+- **Snapshots are not automatic.** Nothing takes one on a timer or size
+  threshold; an operator has to drive it.
+- **InstallSnapshot is not a wire message.** The mechanism exists and is
+  tested, but a leader does not push a snapshot to a lagging follower
+  over the network. The condition is detected and reported rather than
+  repaired automatically.
+- **The WAL is replayed linearly with no index**, so opening a very large
+  log is O(size), and it keeps every record in memory. Bounded in
+  practice by snapshotting, wrong for a log larger than RAM.
+- **No whole-file checksum on the WAL**, only per record. A record that
+  verifies individually inside an otherwise corrupted file is trusted.
+- **No pre-vote.** A node returning from a partition bumps the term and
+  briefly disrupts a healthy leader. Raft's pre-vote extension avoids it.
+- **No leadership transfer** on clean shutdown. A leader shutting down
+  could hand over rather than letting the cluster time out.
+- **No membership changes.** The cluster is fixed at startup. Joint
+  consensus is a hard problem in its own right.
 - **`compactLog` must be driven.** Nothing calls it automatically, so a
   long-running primary grows its log until something does.
 - **No authentication or encryption.** A trusted network is assumed.

@@ -31,7 +31,7 @@ database that replicates by shipping its write-ahead log.
 
 Confirmation that it holds end to end: replaying `scripts/sample_orders.txt`
 through the single-process driver and through a replicated primary/backup
-pair produces the same state checksum, `17373410596180621386`, on all
+pair produces the same state checksum, `17441047841503333197`, on all
 three.
 
 ## Order matters as much as content

@@ -33,14 +33,14 @@ Met. `ctest` runs 22 tests, all green on GCC and Clang.
 The strongest single piece of evidence: replaying `scripts/sample_orders.txt`
 through the Phase 1 single-process driver, through a synchronous
 primary/backup pair, and through an asynchronous one all produce the same
-state checksum, `17373410596180621386`.
+state checksum, `17441047841503333197`.
 
 ```
 $ ./scripts/replication_demo.sh ./build/node \
     scripts/sample_orders.txt sync
 replication demo OK (mode=sync)
   commands applied on both nodes: 12
-  state checksum on both nodes:   17373410596180621386
+  state checksum on both nodes:   17441047841503333197
 ```
 
 ## Benchmark
